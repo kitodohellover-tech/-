@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import base64
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from openai import AsyncOpenAI
@@ -10,7 +11,6 @@ from aiohttp import web
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 
-# Groq через OpenAI-совместимый клиент
 client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_KEY,
@@ -19,7 +19,6 @@ client = AsyncOpenAI(
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Память диалога (в словаре, сбрасывается при перезапуске)
 history = {}
 
 @dp.message(Command("start"))
@@ -38,7 +37,27 @@ async def chat(msg: types.Message):
     if user_id not in history:
         history[user_id] = []
 
-    history[user_id].append({"role": "user", "content": msg.text})
+    # Фото
+    if msg.photo:
+        photo = msg.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        image_data = await bot.download_file(file.file_path)
+        base64_image = base64.b64encode(image_data.read()).decode('utf-8')
+
+        user_content = [
+            {"type": "text", "text": msg.caption or "Что на этом изображении?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+        ]
+        history[user_id].append({"role": "user", "content": user_content})
+
+    # Текст
+    elif msg.text:
+        history[user_id].append({"role": "user", "content": msg.text})
+
+    # Всё остальное — игнорируем
+    else:
+        return
+
     if len(history[user_id]) > 10:
         history[user_id] = history[user_id][-10:]
 
@@ -46,7 +65,7 @@ async def chat(msg: types.Message):
 
     try:
         response = await client.chat.completions.create(
-            model="openai/gpt-oss-120b",  # актуальная модель на Groq
+            model="qwen/qwen3.6-27b",
             messages=[
                 {"role": "system", "content": "Ты полезный ассистент. Отвечай кратко."},
                 *history[user_id]
@@ -58,17 +77,17 @@ async def chat(msg: types.Message):
         await msg.answer(answer)
 
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        await msg.answer("Упс, ошибка. Попробуй позже.")
+        error_text = str(e)
+        logging.error(f"Ошибка: {error_text}")
+        await msg.answer(f"❌ {error_text[:300]}")
 
-# --- Веб-сервер для Render (чтобы не было "No open ports detected") ---
+# --- Веб-сервер для Render ---
 async def handle(request):
     return web.Response(text="Bot is running!")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
 
-    # Запускаем веб-сервер на порту, который даёт Render
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -78,7 +97,6 @@ async def main():
     await site.start()
     logging.info(f"Web server on port {port}")
 
-    # Запускаем бота (polling)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
