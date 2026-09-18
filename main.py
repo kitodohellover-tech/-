@@ -2,14 +2,20 @@ import asyncio
 import logging
 import os
 import base64
+import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from openai import AsyncOpenAI
 from aiohttp import web
 
 # --- Конфиг ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ⚠️ ЗАМЕНИ НА СВОЙ ID И ID ДРУЗЕЙ
+ALLOWED_IDS = [8981457970]
 
 client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -19,53 +25,95 @@ client = AsyncOpenAI(
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Память диалога
-history = {}
+db_pool = None
+
 
 # --- Разбивка длинных сообщений ---
 def split_message(text: str, limit: int = 4000) -> list[str]:
-    """Разбивает длинный текст на куски по limit символов."""
     if len(text) <= limit:
         return [text]
-
     parts = []
     while text:
         if len(text) <= limit:
             parts.append(text)
             break
-
         chunk = text[:limit]
         split_pos = chunk.rfind("\n")
         if split_pos == -1:
             split_pos = chunk.rfind(" ")
         if split_pos == -1:
             split_pos = limit
-
         parts.append(text[:split_pos])
         text = text[split_pos:].lstrip("\n")
-
     return parts
 
 
+# --- Middleware: белый список ---
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, types.Message):
+            if event.from_user.id not in ALLOWED_IDS:
+                logging.info(f"Отказано: {event.from_user.id}")
+                return
+        return await handler(event, data)
+
+dp.message.middleware(AccessMiddleware())
+
+
+# --- Работа с БД ---
+async def init_db():
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                role TEXT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+async def save_message(user_id: int, role: str, content: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO messages (user_id, role, content) VALUES ($1, $2, $3)",
+            user_id, role, content
+        )
+
+async def get_history(user_id: int, limit: int = 20):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT role, content FROM messages WHERE user_id = $1 ORDER BY id DESC LIMIT $2",
+            user_id, limit
+        )
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+async def clear_history(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM messages WHERE user_id = $1", user_id)
+
+
+# --- Хендлеры ---
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    history[msg.from_user.id] = []
-    await msg.answer("Привет! Я бот на Llama 3.3. Спрашивай что угодно или присылай фото.")
-
+    await msg.answer(
+        "Привет! Я бот с памятью. Спрашивай что угодно или присылай фото.\n\n"
+        "/reset — очистить историю диалога"
+    )
 
 @dp.message(Command("reset"))
 async def reset(msg: types.Message):
-    history[msg.from_user.id] = []
-    await msg.answer("Контекст очищен.")
+    await clear_history(msg.from_user.id)
+    await msg.answer("История диалога очищена.")
 
 
 @dp.message()
 async def chat(msg: types.Message):
     user_id = msg.from_user.id
-    if user_id not in history:
-        history[user_id] = []
 
-    # --- Фото ---
+    history = await get_history(user_id)
+
+    # --- ФОТО ---
     if msg.photo:
         photo = msg.photo[-1]
         file = await bot.get_file(photo.file_id)
@@ -74,23 +122,18 @@ async def chat(msg: types.Message):
 
         user_content = [
             {"type": "text", "text": msg.caption or "Что на этом изображении?"},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-            },
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
         ]
-        history[user_id].append({"role": "user", "content": user_content})
+        await save_message(user_id, "user", msg.caption or "[Фото]")
+        history.append({"role": "user", "content": user_content})
 
-    # --- Текст ---
+    # --- ТЕКСТ ---
     elif msg.text:
-        history[user_id].append({"role": "user", "content": msg.text})
+        await save_message(user_id, "user", msg.text)
+        history.append({"role": "user", "content": msg.text})
 
-    # --- Всё остальное игнорируем ---
     else:
         return
-
-    if len(history[user_id]) > 10:
-        history[user_id] = history[user_id][-10:]
 
     await bot.send_chat_action(msg.chat.id, "typing")
 
@@ -98,18 +141,14 @@ async def chat(msg: types.Message):
         response = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Ты полезный ассистент. Отвечай по делу. Никогда не сокращай код и не пиши '...' вместо пропущенного — выдавай всё полностью.",
-                },
-                *history[user_id],
+                {"role": "system", "content": "Ты полезный ассистент. Отвечай по делу. Никогда не сокращай код."},
+                *history
             ],
             temperature=0.7,
         )
         answer = response.choices[0].message.content
-        history[user_id].append({"role": "assistant", "content": answer})
+        await save_message(user_id, "assistant", answer)
 
-        # --- Отправка с разбивкой ---
         parts = split_message(answer)
         if len(parts) == 1:
             await msg.answer(parts[0])
@@ -129,7 +168,12 @@ async def handle(request):
 
 
 async def main():
+    global db_pool
     logging.basicConfig(level=logging.INFO)
+
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    await init_db()
+    logging.info("База данных подключена")
 
     app = web.Application()
     app.router.add_get("/", handle)
