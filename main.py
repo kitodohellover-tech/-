@@ -65,7 +65,7 @@ async def chat(msg: types.Message):
 
     try:
         response = await client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
+            model="qwen/qwen3.8-27b",
             messages=[
                 {"role": "system", "content": "Ты полезный ассистент. Отвечай кратко."},
                 *history[user_id]
