@@ -15,7 +15,7 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ⚠️ ЗАМЕНИ НА СВОЙ ID И ID ДРУЗЕЙ
-ALLOWED_IDS = [8981457970]
+ALLOWED_IDS = [8834374199]
 
 client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
