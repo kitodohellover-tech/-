@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import base64
+from io import BytesIO
 import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -14,8 +15,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ⚠️ ЗАМЕНИ НА СВОЙ ID И ID ДРУЗЕЙ
-ALLOWED_IDS = [8834374199, 5389046699, 5264513480]
+# ⚠️ ТВОЙ ID И ID ДРУЗЕЙ
+ALLOWED_IDS = [8834374199]
 
 client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -93,11 +94,28 @@ async def clear_history(user_id: int):
         await conn.execute("DELETE FROM messages WHERE user_id = $1", user_id)
 
 
+# --- Транскрипция аудио через Groq Whisper ---
+async def transcribe_audio(file_id: str, file_ext: str = "ogg") -> str:
+    file = await bot.get_file(file_id)
+    audio_data = await bot.download_file(file.file_path)
+
+    buffer = BytesIO(audio_data.read())
+    buffer.name = f"audio.{file_ext}"
+
+    transcription = await client.audio.transcriptions.create(
+        model="whisper-large-v3",
+        file=buffer,
+        language="ru",
+    )
+    return transcription.text
+
+
 # --- Хендлеры ---
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     await msg.answer(
-        "Привет! Я бот с памятью. Спрашивай что угодно или присылай фото.\n\n"
+        "Привет! Я бот с памятью. Спрашивай что угодно, присылай фото, "
+        "голосовые или аудиофайлы.\n\n"
         "/reset — очистить историю диалога"
     )
 
@@ -110,8 +128,10 @@ async def reset(msg: types.Message):
 @dp.message()
 async def chat(msg: types.Message):
     user_id = msg.from_user.id
-
     history = await get_history(user_id)
+
+    user_content = None
+    save_text = None
 
     # --- ФОТО ---
     if msg.photo:
@@ -124,16 +144,47 @@ async def chat(msg: types.Message):
             {"type": "text", "text": msg.caption or "Что на этом изображении?"},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
         ]
-        await save_message(user_id, "user", msg.caption or "[Фото]")
-        history.append({"role": "user", "content": user_content})
+        save_text = msg.caption or "[Фото]"
+
+    # --- ГОЛОСОВОЕ ---
+    elif msg.voice:
+        await bot.send_chat_action(msg.chat.id, "typing")
+        try:
+            text = await transcribe_audio(msg.voice.file_id, "ogg")
+        except Exception as e:
+            logging.error(f"Whisper error: {e}")
+            await msg.answer(f"❌ Не смог распознать голосовое: {str(e)[:200]}")
+            return
+        user_content = text
+        save_text = f"[Голосовое]: {text}"
+
+    # --- АУДИОФАЙЛ ---
+    elif msg.audio:
+        await bot.send_chat_action(msg.chat.id, "typing")
+        # Определяем расширение из имени файла, по умолчанию mp3
+        ext = "mp3"
+        if msg.audio.file_name and "." in msg.audio.file_name:
+            ext = msg.audio.file_name.rsplit(".", 1)[-1].lower()
+        try:
+            text = await transcribe_audio(msg.audio.file_id, ext)
+        except Exception as e:
+            logging.error(f"Whisper error: {e}")
+            await msg.answer(f"❌ Не смог распознать аудио: {str(e)[:200]}")
+            return
+        user_content = text
+        save_text = f"[Аудио]: {text}"
 
     # --- ТЕКСТ ---
     elif msg.text:
-        await save_message(user_id, "user", msg.text)
-        history.append({"role": "user", "content": msg.text})
+        user_content = msg.text
+        save_text = msg.text
 
     else:
         return
+
+    # Сохраняем в базу и добавляем в контекст
+    await save_message(user_id, "user", save_text)
+    history.append({"role": "user", "content": user_content})
 
     await bot.send_chat_action(msg.chat.id, "typing")
 
