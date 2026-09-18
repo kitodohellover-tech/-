@@ -46,7 +46,7 @@ async def chat(msg: types.Message):
 
     try:
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",   # актуальная модель на Groq
+            model="openai/gpt-oss-120b",  # актуальная модель на Groq
             messages=[
                 {"role": "system", "content": "Ты полезный ассистент. Отвечай кратко."},
                 *history[user_id]
