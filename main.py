@@ -6,7 +6,7 @@ from io import BytesIO
 import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram import BaseMiddleware
 from openai import AsyncOpenAI
 from aiohttp import web
 
