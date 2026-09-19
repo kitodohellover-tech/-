@@ -116,6 +116,36 @@ async def text_to_voice(text: str) -> str:
     return output_file
 
 
+# --- Комментарий к файлу в стиле Лайта ---
+async def get_file_comment(file_type: str, topic: str, user_id: int) -> str:
+    """Генерирует короткий комментарий к файлу в стиле Лайта."""
+    personal = PERSONAL_PROMPTS.get(user_id, "")
+    
+    prompt = (
+        f"Ты — Лайт. Ты только что собрал {file_type} на тему «{topic}» "
+        f"и скидываешь его другу. Напиши ОДНО короткое предложение-комментарий "
+        f"в своём стиле: с лёгкой иронией, как будто ты скидываешь файл "
+        f"из своего редактора. Без markdown, без кавычек, без лишних слов. "
+        f"Примеры: «Держи. Накидал по быстрому, если что — правь», "
+        f"«Смотри, что собрал. Не благодари», «Готово. Работает как надо». "
+        f"Только текст, одно предложение."
+    )
+    
+    response = await client.chat.completions.create(
+        model="qwen/qwen3.8-27b",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT + personal},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.9,
+        max_tokens=80,
+    )
+    comment = response.choices[0].message.content.strip()
+    # Убираем возможные кавычки
+    comment = comment.strip('"').strip("«»").strip()
+    return comment
+
+
 # --- БД ---
 async def init_db():
     async with db_pool.acquire() as conn:
@@ -391,6 +421,7 @@ async def set_tone_cmd(msg: types.Message):
 # --- Генерация .docx ---
 @dp.message(Command("docx"))
 async def make_docx(msg: types.Message):
+    user_id = msg.from_user.id
     topic = msg.text.replace("/docx", "").strip()
     if not topic:
         await msg.answer(
@@ -426,7 +457,6 @@ async def make_docx(msg: types.Message):
             line = line.strip()
             if not line:
                 continue
-            # Простая эвристика: строка без точки в конце и короче 80 символов — заголовок
             if len(line) < 80 and not line.endswith(".") and not line.startswith("-"):
                 doc.add_heading(line, level=1)
             else:
@@ -435,10 +465,13 @@ async def make_docx(msg: types.Message):
         file_path = "document.docx"
         doc.save(file_path)
 
+        # Комментарий в стиле Лайта
+        comment = await get_file_comment("документ Word", topic, user_id)
+
         safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
         await msg.answer_document(
             FSInputFile(file_path, filename=f"{safe_name}.docx"),
-            caption=f"📄 Документ готов: _{topic}_"
+            caption=comment
         )
         await status.delete()
 
@@ -450,6 +483,7 @@ async def make_docx(msg: types.Message):
 # --- Генерация .pptx ---
 @dp.message(Command("pptx"))
 async def make_pptx(msg: types.Message):
+    user_id = msg.from_user.id
     topic = msg.text.replace("/pptx", "").strip()
     if not topic:
         await msg.answer(
@@ -493,7 +527,6 @@ async def make_pptx(msg: types.Message):
                 continue
 
             if i == 0:
-                # Титульный слайд
                 slide = prs.slides.add_slide(prs.slide_layouts[0])
                 slide.shapes.title.text = lines[0]
                 if len(lines) > 1:
@@ -513,10 +546,13 @@ async def make_pptx(msg: types.Message):
         file_path = "presentation.pptx"
         prs.save(file_path)
 
+        # Комментарий в стиле Лайта
+        comment = await get_file_comment("презентация PowerPoint", topic, user_id)
+
         safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
         await msg.answer_document(
             FSInputFile(file_path, filename=f"{safe_name}.pptx"),
-            caption=f"📊 Презентация готова: _{topic}_"
+            caption=comment
         )
         await status.delete()
 
@@ -607,16 +643,14 @@ async def chat(msg: types.Message):
         if use_file:
             ext = detect_extension(answer)
             file_name = f"light_answer.{ext}"
-            preview = answer[:500] + ("..." if len(answer) > 500 else "")
 
-            await msg.answer(
-                f"Смотри, что написал. Файл: `{file_name}`\n\n"
-                f"**Превью:**\n{preview}"
-            )
+            # Комментарий в стиле Лайта
+            comment = await get_file_comment(f"файл .{ext}", "код/ответ", user_id)
 
             file_buffer = BytesIO(answer.encode("utf-8"))
             await msg.answer_document(
-                BufferedInputFile(file_buffer.read(), filename=file_name)
+                BufferedInputFile(file_buffer.read(), filename=file_name),
+                caption=comment
             )
         else:
             parts = split_message(answer)
