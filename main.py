@@ -126,9 +126,8 @@ def parse_json_safe(raw: str):
     return None
 
 
-# --- Автоперевод промпта на английский ---
+# --- Автоперевод ---
 async def translate_to_english(text: str) -> str:
-    """Переводит русский промпт на английский для лучшего понимания моделью."""
     try:
         response = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
@@ -139,7 +138,7 @@ async def translate_to_english(text: str) -> str:
                         "Ты переводчик для генерации изображений. "
                         "Переведи текст пользователя на английский язык. "
                         "Сохрани ВСЕ детали: цвета, объекты, стиль, настроение, время года. "
-                        "Верни ТОЛЬКО перевод, без пояснений, без кавычек, без markdown."
+                        "Верни ТОЛЬКО перевод, без пояснений, без кавычек."
                     )
                 },
                 {"role": "user", "content": text}
@@ -149,16 +148,15 @@ async def translate_to_english(text: str) -> str:
         )
         translated = response.choices[0].message.content.strip()
         translated = translated.strip('"').strip("'").strip()
-        logging.info(f"[TRANSLATE] '{text[:50]}' → '{translated[:80]}'")
+        logging.info(f"[TRANSLATE] '{text[:50]}' -> '{translated[:80]}'")
         return translated
     except Exception as e:
         logging.error(f"[TRANSLATE] Error: {e}")
-        return text  # Fallback — возвращаем как есть
+        return text
 
 
-# --- Генерация картинки (Hugging Face) ---
+# --- Генерация картинки ---
 async def generate_image(prompt: str) -> BytesIO | None:
-    """Генерирует картинку через Hugging Face Inference API (FLUX.1-schnell)."""
     if not hf_client:
         logging.error("[HF] HF_TOKEN не установлен")
         return None
@@ -253,7 +251,7 @@ async def text_to_voice(text: str) -> str:
     return output_file
 
 
-# --- Комментарий к файлу ---
+# --- Комментарий ---
 async def get_file_comment(file_type: str, topic: str, user_id: int) -> str:
     personal = PERSONAL_PROMPTS.get(user_id, "")
     prompt = (
@@ -261,7 +259,7 @@ async def get_file_comment(file_type: str, topic: str, user_id: int) -> str:
         f"и скидываешь его другу. Напиши ОДНО короткое предложение-комментарий "
         f"в своём стиле: с лёгкой иронией. "
         f"НЕ используй слово «собрал» — используй «нарисовал», «сделал», «сгенерил», «готово». "
-        f"Без markdown, без кавычек. Только текст."
+        f"Без markdown, без кавычек."
     )
     response = await client.chat.completions.create(
         model="qwen/qwen3.8-27b",
@@ -405,10 +403,6 @@ PERSONAL_PROMPTS = {
         "Делает ботов, думает про монетизацию. \n"
         "\n"
         "С НИМ: Полный мат, глумление, чёрный юмор. Как с равным. \n"
-        "\n"
-        "ПРИМЕРЫ:\n"
-        "• «Скучно» → «Найди пятый угол у квадрата»\n"
-        "• «Привет» → «Привет, что у нас там с проектом?»\n"
     ),
     8834374199: (
         "\n\n"
@@ -496,23 +490,19 @@ async def set_tone_cmd(msg: types.Message):
     await msg.answer(f"Принял. Теперь буду учитывать: _{tone}_")
 
 
-# --- Генерация картинки (с автопереводом) ---
+# --- Генерация картинки ---
 @dp.message(Command("image"))
 async def make_image(msg: types.Message):
     user_id = msg.from_user.id
     prompt = msg.text.replace("/image", "").strip()
     if not prompt:
-        await msg.answer(
-            "🎨 Что нарисовать? Напиши промпт.\n"
-            "Например: `/image кот в космосе`"
-        )
+        await msg.answer("🎨 Что нарисовать? `/image кот в космосе`")
         return
 
     await bot.send_chat_action(msg.chat.id, "upload_photo")
-    status = await msg.answer(f"🎨 Генерирую: _{prompt}_...\nПеревожу и рисую, 20-60 секунд.")
+    status = await msg.answer(f"🎨 Генерирую: _{prompt}_...")
 
     try:
-        # Автоперевод на английский
         await status.edit_text(f"🌐 Перевожу промпт на английский...")
         prompt_en = await translate_to_english(prompt)
 
@@ -520,7 +510,7 @@ async def make_image(msg: types.Message):
 
         img_bytes = await generate_image(prompt_en)
         if not img_bytes:
-            await status.edit_text("❌ Не удалось сгенерировать. Попробуй позже или измени промпт.")
+            await status.edit_text("❌ Не удалось. Попробуй позже.")
             return
 
         comment = await get_file_comment("картинка", prompt, user_id)
@@ -543,7 +533,7 @@ async def make_docx(msg: types.Message):
     user_id = msg.from_user.id
     topic = msg.text.replace("/docx", "").strip()
     if not topic:
-        await msg.answer("📄 Что за документ? `/docx реферат про космос`")
+        await msg.answer("📄 Что за документ? `/docx реферат`")
         return
 
     await bot.send_chat_action(msg.chat.id, "typing")
@@ -552,7 +542,7 @@ async def make_docx(msg: types.Message):
     try:
         prompt = (
             f"Напиши структуру и содержание документа на тему: «{topic}». "
-            f"Формат: заголовки разделов, под ними — краткий текст (1–2 абзаца). "
+            f"Формат: заголовки разделов, под ними — краткий текст. "
             f"Без markdown. Объём — 1–2 страницы."
         )
         response = await client.chat.completions.create(
@@ -590,7 +580,7 @@ async def make_docx(msg: types.Message):
         await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
 
 
-# --- Генерация .pptx с картинками ---
+# --- Генерация .pptx ---
 @dp.message(Command("pptx"))
 async def make_pptx(msg: types.Message):
     user_id = msg.from_user.id
@@ -606,12 +596,12 @@ async def make_pptx(msg: types.Message):
         await status.edit_text(f"📊 Генерирую текст слайдов...")
         prompt = (
             f"Сделай презентацию на тему: «{topic}». "
-            f"Верни ТОЛЬКО JSON-массив без пояснений. "
-            f'Формат: [{{"title": "Заголовок", "points": ["пункт 1", "пункт 2"], "image_prompt": "english prompt"}}, ...] '
+            f"Верни ТОЛЬКО JSON-массив. "
+            f'Формат: [{{"title": "Заголовок", "points": ["пункт 1"], "image_prompt": "english prompt"}}, ...] '
             f"Сделай РОВНО 8 слайдов. Первый — титульный. "
-            f"В каждом слайде 5-6 пунктов, до 120 символов. "
-            f"image_prompt — короткое описание картинки НА АНГЛИЙСКОМ. "
-            f"Только JSON, без markdown."
+            f"5-6 пунктов на слайд, до 120 символов. "
+            f"image_prompt — описание картинки НА АНГЛИЙСКОМ. "
+            f"Только JSON."
         )
         response = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
@@ -622,24 +612,21 @@ async def make_pptx(msg: types.Message):
         raw = response.choices[0].message.content
         slides_data = parse_json_safe(raw)
         if not slides_data:
-            raise ValueError("Модель вернула невалидный JSON")
+            raise ValueError("Невалидный JSON")
 
         total = len(slides_data)
         logging.info(f"[PPTX] Slides: {total}")
 
         await status.edit_text(f"📊 Генерирую {total} картинок...")
         image_prompts = [s.get("image_prompt", s.get("title", "abstract")) for s in slides_data]
-        logging.info(f"[PPTX] Image prompts: {image_prompts[:2]}...")
-
         images = await asyncio.gather(
             *[generate_image(p) for p in image_prompts],
             return_exceptions=True
         )
-
         success_count = sum(1 for img in images if isinstance(img, BytesIO))
         logging.info(f"[PPTX] Images generated: {success_count}/{total}")
 
-        await status.edit_text(f"📊 Собираю презентацию ({success_count}/{total} картинок)...")
+        await status.edit_text(f"📊 Собираю pptx ({success_count}/{total} картинок)...")
         from pptx import Presentation
         from pptx.util import Inches, Pt
 
@@ -652,38 +639,32 @@ async def make_pptx(msg: types.Message):
             points = slide_data.get("points", [])
             img_bytes = images[i] if i < len(images) and isinstance(images[i], BytesIO) else None
 
-            blank_layout = prs.slide_layouts[6]
-            slide = prs.slides.add_slide(blank_layout)
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
 
             title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
-            title_frame = title_box.text_frame
-            title_frame.text = title
-            title_frame.paragraphs[0].font.size = Pt(28)
-            title_frame.paragraphs[0].font.bold = True
+            title_box.text_frame.text = title
+            title_box.text_frame.paragraphs[0].font.size = Pt(28)
+            title_box.text_frame.paragraphs[0].font.bold = True
 
             text_box = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(5), Inches(5.5))
-            text_frame = text_box.text_frame
-            text_frame.word_wrap = True
+            tf = text_box.text_frame
+            tf.word_wrap = True
             for j, point in enumerate(points):
-                p = text_frame.paragraphs[0] if j == 0 else text_frame.add_paragraph()
+                p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
                 p.text = f"• {point}"
                 p.font.size = Pt(14)
 
             if img_bytes:
                 img_bytes.seek(0)
                 try:
-                    slide.shapes.add_picture(
-                        img_bytes,
-                        Inches(5.5), Inches(1.5),
-                        width=Inches(4), height=Inches(5.5)
-                    )
+                    slide.shapes.add_picture(img_bytes, Inches(5.5), Inches(1.5), width=Inches(4), height=Inches(5.5))
                 except Exception as e:
-                    logging.error(f"[PPTX] Picture insert error: {e}")
+                    logging.error(f"[PPTX] Picture: {e}")
 
         file_path = "presentation.pptx"
         prs.save(file_path)
 
-        comment = await get_file_comment("презентация PowerPoint", topic, user_id)
+        comment = await get_file_comment("презентация", topic, user_id)
         safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
 
         await msg.answer_document(
@@ -691,7 +672,6 @@ async def make_pptx(msg: types.Message):
             caption=comment
         )
         await status.delete()
-
     except Exception as e:
         logging.error(f"PPTX error: {e}")
         await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
@@ -725,7 +705,7 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, use
             doc.save(out_path)
             await msg.answer_document(
                 FSInputFile(out_path, filename=f"updated_{safe_name}"),
-                caption=await get_file_comment("обновлённый Word-документ", file_name, user_id)
+                caption=await get_file_comment("обновлённый документ", file_name, user_id)
             )
 
         elif ext == "pptx":
@@ -759,8 +739,7 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, use
                     continue
                 img_bytes = images[i] if i < len(images) and isinstance(images[i], BytesIO) else None
 
-                blank_layout = prs.slide_layouts[6]
-                slide = prs.slides.add_slide(blank_layout)
+                slide = prs.slides.add_slide(prs.slide_layouts[6])
 
                 title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
                 title_box.text_frame.text = title
@@ -780,7 +759,7 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, use
                     try:
                         slide.shapes.add_picture(img_bytes, Inches(5.5), Inches(1.5), width=Inches(4), height=Inches(5.5))
                     except Exception as e:
-                        logging.error(f"[PPTX EDIT] Picture error: {e}")
+                        logging.error(f"[PPTX EDIT] Picture: {e}")
 
             out_path = "updated.pptx"
             prs.save(out_path)
@@ -789,7 +768,7 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, use
                 caption=await get_file_comment("обновлённая презентация", file_name, user_id)
             )
 
-elif ext == "pdf":
+        elif ext == "pdf":
             await msg.answer(f"📄 PDF не пересобираю, вот текст:\n\n{ai_response[:3500]}")
 
     except Exception as e:
@@ -858,7 +837,7 @@ async def chat(msg: types.Message):
             file_bytes = await download_file_bytes(doc.file_id)
             doc_info = (file_bytes, file_name, ext)
             caption = msg.caption or "Что сделать с этим файлом?"
-            user_content = f"[Файл: {file_name}]\n\nСодержимое:\n{doc_text[:8000]}\n\nЗапрос: {caption}"
+            user_content = f"[Файл: {file_name}]\n\n{doc_text[:8000]}\n\nЗапрос: {caption}"
             save_text = f"[Документ {file_name}]: {caption}"
             is_document_edit = True
         except Exception as e:
@@ -874,90 +853,4 @@ async def chat(msg: types.Message):
     await save_message(user_id, "user", save_text)
     history.append({"role": "user", "content": user_content})
     history = trim_history_by_chars(history)
-    await bot.send_chat_action(msg.chat.id, "typing")
-
-    personal = PERSONAL_PROMPTS.get(user_id, "")
-    user_tone = await get_user_tone(user_id)
-    tone_addition = f"\n\nПОЖЕЛАНИЯ К ТОНУ: {user_tone}" if user_tone else ""
-    full_prompt = SYSTEM_PROMPT + personal + tone_addition
-
-    try:
-        response = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[
-                {"role": "system", "content": full_prompt},
-                *history
-            ],
-            temperature=0.7,
-            max_tokens=1200,
-        )
-        answer = response.choices[0].message.content
-        await save_message(user_id, "assistant", answer)
-
-        if is_document_edit and doc_info:
-            file_bytes, file_name, ext = doc_info
-            await handle_document_edit(msg, answer, file_bytes, file_name, ext, user_id)
-        else:
-            use_file = (mode == "file") or (len(answer) > 4000)
-            if use_file:
-                ext_out = detect_extension(answer)
-                file_name_out = f"light_answer.{ext_out}"
-                comment = await get_file_comment(f"файл .{ext_out}", "код/ответ", user_id)
-                file_buffer = BytesIO(answer.encode("utf-8"))
-                await msg.answer_document(
-                    BufferedInputFile(file_buffer.read(), filename=file_name_out),
-                    caption=comment
-                )
-            else:
-                parts = split_message(answer)
-                if len(parts) == 1:
-                    await msg.answer(parts[0])
-                else:
-                    for i, part in enumerate(parts, 1):
-                        await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
-
-            if mode == "voice":
-                await bot.send_chat_action(msg.chat.id, "record_voice")
-                try:
-                    voice_file = await text_to_voice(answer)
-                    if voice_file:
-                        await msg.answer_voice(FSInputFile(voice_file))
-                except Exception as e:
-                    logging.error(f"TTS error: {e}")
-
-    except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        await msg.answer(f"❌ {str(e)[:300]}")
-
-
-# --- Веб-сервер ---
-async def handle(request):
-    return web.Response(text="Bot is running!")
-
-
-async def main():
-    global db_pool
-    logging.basicConfig(level=logging.INFO)
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    await init_db()
-    logging.info("База данных подключена")
-
-    if hf_client:
-        logging.info("Hugging Face клиент инициализирован")
-    else:
-        logging.warning("HF_TOKEN не установлен — картинки не будут генерироваться")
-
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"Web server on port {port}")
-
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await bot.send
