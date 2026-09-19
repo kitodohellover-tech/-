@@ -8,3 +8,5 @@ python-pptx
 PyPDF2
 huggingface_hub
 Pillow
+pexafy
+requests
