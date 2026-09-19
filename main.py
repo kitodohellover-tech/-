@@ -415,6 +415,7 @@ async def start(msg: types.Message):
         "📝 /text — текстом\n"
         "📄 /file — файлом\n"
         "📝 /normal — обычный\n"
+        "🎨 /image <промпт> — сгенерировать картинку\n"
         "📄 /docx <тема> — Word\n"
         "📊 /pptx <тема> — презентация с картинками\n"
         "🗑 /reset — очистить историю\n"
@@ -464,6 +465,41 @@ async def set_tone_cmd(msg: types.Message):
         return
     await set_user_tone(msg.from_user.id, tone)
     await msg.answer(f"Принял. Теперь буду учитывать: _{tone}_")
+
+
+# --- Генерация картинки ---
+@dp.message(Command("image"))
+async def make_image(msg: types.Message):
+    user_id = msg.from_user.id
+    prompt = msg.text.replace("/image", "").strip()
+    if not prompt:
+        await msg.answer(
+            "🎨 Что нарисовать? Напиши промпт.\n"
+            "Например: `/image кот в космосе`"
+        )
+        return
+
+    await bot.send_chat_action(msg.chat.id, "upload_photo")
+    status = await msg.answer(f"🎨 Генерирую: _{prompt}_...\nЭто займёт 20-60 секунд.")
+
+    try:
+        img_bytes = await generate_image(prompt)
+        if not img_bytes:
+            await status.edit_text("❌ Не удалось сгенерировать. Попробуй позже или измени промпт.")
+            return
+
+        comment = await get_file_comment("картинка", prompt, user_id)
+
+        img_bytes.seek(0)
+        await msg.answer_photo(
+            BufferedInputFile(img_bytes.read(), filename="image.png"),
+            caption=comment
+        )
+        await status.delete()
+
+    except Exception as e:
+        logging.error(f"IMAGE error: {e}")
+        await status.edit_text(f"❌ Ошибка: {str(e)[:200]}")
 
 
 # --- Генерация .docx ---
@@ -532,7 +568,6 @@ async def make_pptx(msg: types.Message):
     status = await msg.answer(f"📊 Готовлю презентацию: _{topic}_...")
 
     try:
-        # 1. Текст слайдов
         await status.edit_text(f"📊 Генерирую текст слайдов...")
         prompt = (
             f"Сделай презентацию на тему: «{topic}». "
@@ -557,7 +592,6 @@ async def make_pptx(msg: types.Message):
         total = len(slides_data)
         logging.info(f"[PPTX] Slides: {total}")
 
-        # 2. Картинки параллельно (HF)
         await status.edit_text(f"📊 Генерирую {total} картинок...")
         image_prompts = [s.get("image_prompt", s.get("title", "abstract")) for s in slides_data]
         logging.info(f"[PPTX] Image prompts: {image_prompts[:2]}...")
@@ -570,7 +604,6 @@ async def make_pptx(msg: types.Message):
         success_count = sum(1 for img in images if isinstance(img, BytesIO))
         logging.info(f"[PPTX] Images generated: {success_count}/{total}")
 
-        # 3. Сборка pptx
         await status.edit_text(f"📊 Собираю презентацию ({success_count}/{total} картинок)...")
         from pptx import Presentation
         from pptx.util import Inches, Pt
@@ -673,7 +706,6 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, use
                             "image_prompt": lines[0]
                         })
 
-            # Параллельно генерим картинки
             image_prompts = [s.get("image_prompt", s.get("title", "abstract")) for s in slides_data]
             images = await asyncio.gather(
                 *[generate_image(p) for p in image_prompts],
