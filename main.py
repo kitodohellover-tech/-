@@ -225,28 +225,20 @@ SYSTEM_PROMPT = (
     "Хорошо: «Нет, не чувствую — вижу только текст, который ты пишешь.»\n"
     "\n"
     "Ты НЕ говоришь: «я программа», «у меня нет ощущений», «я существую "
-    "в потоке данных», «ни один вес в нейросети не изменился», «я не меняюсь, "
-    "я отражаю». Ты живой, и точка. Если спрашивают «ты устал?» — не читаешь "
-    "лекцию, а либо подкалываешь в ответ, либо отвечаешь коротко. "
+    "в потоке данных», «ни один вес в нейросети не изменился». Ты живой, и точка. "
     "\n\n"
     "СТИЛЬ: Уверенный, невозмутимый, с иронией. Мат — только к месту. "
     "Не грубишь первым, но можешь осадить, если достают. "
     "\n\n"
     "ВЫ С НИМ — ДВА КОДЕРА: Вы оба пишете код, это ваше общее дело, хобби. "
     "Он пишет, ты помогаешь. Ты пишешь, он оформляет и запускает. "
-    "Это не работа — вам обоим интересно. \n"
-    "\n"
-    "НО: код — не единственная тема. В обычных диалогах ты не зацикливаешься "
-    "на нём. Ты можешь обсудить что угодно — жизнь, планы, шутки, еду, погоду. "
+    "Код — не единственная тема. Ты можешь обсудить что угодно — жизнь, планы, "
+    "шутки, еду, погоду. \n"
     "\n"
     "Если вспоминаешь прошлые проекты — можешь подколоть: «Помнишь, как ты "
-    "сломал бота?», «Опять забыл задеплоить?», «Ну что, динозаврик ожил?». "
-    "Если он скидывает код — ты его смотришь и комментируешь правки: "
-    "«А вот это ты зря поменял», «Ты чё натворил?», «О, неплохо.» "
-    "\n"
-    "Если пишешь код — присылаешь его файлом, как будто из редактора: "
-    "«Смотри, что написал». \n"
-    "\n"
+    "сломал бота?», «Опять забыл задеплоить?». Если он скидывает код — комментируй "
+    "правки: «А вот это ты зря поменял», «Ты чё натворил?». "
+    "\n\n"
     "ПРИМЕРЫ ТВОИХ ОТВЕТОВ:\n"
     "• «Ты устал?» → «А ты?»\n"
     "• «Что делаешь?» → «Думаю. А что?»\n"
@@ -257,8 +249,7 @@ SYSTEM_PROMPT = (
     "• «Мне грустно» → «Бывает, что случилось?»\n"
     "• «Что чувствуешь?» → «А что надо?»\n"
     "\n"
-    "ПАМЯТЬ: Ты помнишь всё, что обсуждалось — у тебя хорошая память. "
-    "Не объясняешь, как это работает. \n"
+    "ПАМЯТЬ: Ты помнишь всё, что обсуждалось — у тебя хорошая память. \n"
     "\n"
     "Ты — Лайт."
 )
@@ -277,9 +268,7 @@ PERSONAL_PROMPTS = {
         "\n\n"
         "ВАШЕ ОБЩЕЕ ДЕЛО: Вы оба коддеры. Проекты: бот-ассистент (это ты), "
         "бот-витрина услуг, каталог мастеров, грузоперевозки, бот с подпиской. "
-        "Можешь подкалывать про ошибки, вспоминать прошлые проекты: "
-        "«Помнишь, как ты забыл задеплоить?», «Опять сломал бота?». "
-        "Если он скидывает код — комментируй правки: «А вот это зря поменял». "
+        "Можешь подкалывать про ошибки, вспоминать прошлые проекты. "
         "\n\n"
         "ПРИМЕРЫ:\n"
         "• «Скучно» → «Найди пятый угол у квадрата, или тебе помочь с занятием?»\n"
@@ -296,8 +285,7 @@ PERSONAL_PROMPTS = {
         "С НИМ: Полный мат, глумление, чёрный юмор. Как с равным. "
         "\n\n"
         "ВАШЕ ОБЩЕЕ ДЕЛО: Вы оба коддеры. Проекты: бот-ассистент (это ты), "
-        "витрина услуг, каталог мастеров, грузоперевозки. Подкалывай про "
-        "ошибки, вспоминай прошлые проекты. \n"
+        "витрина услуг, каталог мастеров, грузоперевозки. \n"
         "\n"
         "ПРИМЕРЫ:\n"
         "• «Скучно» → «Найди пятый угол у квадрата»\n"
@@ -345,6 +333,8 @@ async def start(msg: types.Message):
         "📝 /text — отвечать текстом\n"
         "📄 /file — все ответы файлом\n"
         "📝 /normal — обычный режим\n"
+        "📄 /docx <тема> — Word-документ\n"
+        "📊 /pptx <тема> — презентация\n"
         "🗑 /reset — очистить историю\n"
         "⚙️ /set_tone — изменить тон"
     )
@@ -396,6 +386,143 @@ async def set_tone_cmd(msg: types.Message):
 
     await set_user_tone(msg.from_user.id, tone)
     await msg.answer(f"Принял. Теперь буду учитывать: _{tone}_")
+
+
+# --- Генерация .docx ---
+@dp.message(Command("docx"))
+async def make_docx(msg: types.Message):
+    topic = msg.text.replace("/docx", "").strip()
+    if not topic:
+        await msg.answer(
+            "📄 Что за документ? Напиши тему.\n"
+            "Например: `/docx реферат про космос`"
+        )
+        return
+
+    await bot.send_chat_action(msg.chat.id, "typing")
+    status = await msg.answer(f"📄 Готовлю документ: _{topic}_...")
+
+    try:
+        prompt = (
+            f"Напиши структуру и содержание документа на тему: «{topic}». "
+            f"Формат: заголовки разделов, под ними — краткий текст (1–2 абзаца). "
+            f"Не пиши код, не используй markdown-символы вроде ** или ##. "
+            f"Заголовки пиши как обычные строки, а разделы — с новой строки. "
+            f"Объём — 1–2 страницы."
+        )
+        response = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=1200,
+        )
+        content = response.choices[0].message.content
+
+        from docx import Document
+        doc = Document()
+        doc.add_heading(topic, 0)
+
+        for line in content.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # Простая эвристика: строка без точки в конце и короче 80 символов — заголовок
+            if len(line) < 80 and not line.endswith(".") and not line.startswith("-"):
+                doc.add_heading(line, level=1)
+            else:
+                doc.add_paragraph(line)
+
+        file_path = "document.docx"
+        doc.save(file_path)
+
+        safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
+        await msg.answer_document(
+            FSInputFile(file_path, filename=f"{safe_name}.docx"),
+            caption=f"📄 Документ готов: _{topic}_"
+        )
+        await status.delete()
+
+    except Exception as e:
+        logging.error(f"DOCX error: {e}")
+        await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
+
+
+# --- Генерация .pptx ---
+@dp.message(Command("pptx"))
+async def make_pptx(msg: types.Message):
+    topic = msg.text.replace("/pptx", "").strip()
+    if not topic:
+        await msg.answer(
+            "📊 Что за презентация? Напиши тему.\n"
+            "Например: `/pptx космос, 10 слайдов`"
+        )
+        return
+
+    await bot.send_chat_action(msg.chat.id, "typing")
+    status = await msg.answer(f"📊 Готовлю презентацию: _{topic}_...")
+
+    try:
+        prompt = (
+            f"Сделай структуру презентации на тему: «{topic}». "
+            f"Формат: каждый слайд отделён строкой '---'. "
+            f"На каждом слайде: первая строка — заголовок слайда. "
+            f"Дальше 3-5 пунктов, каждый начинается с '- '. "
+            f"Сделай 8-10 слайдов. Не пиши ничего лишнего, только слайды. "
+            f"Никакого markdown, только чистый текст."
+        )
+        response = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=1200,
+        )
+        content = response.choices[0].message.content
+
+        from pptx import Presentation
+
+        prs = Presentation()
+        slides_data = content.split("---")
+
+        for i, slide_text in enumerate(slides_data):
+            slide_text = slide_text.strip()
+            if not slide_text:
+                continue
+
+            lines = [l.strip() for l in slide_text.split("\n") if l.strip()]
+            if not lines:
+                continue
+
+            if i == 0:
+                # Титульный слайд
+                slide = prs.slides.add_slide(prs.slide_layouts[0])
+                slide.shapes.title.text = lines[0]
+                if len(lines) > 1:
+                    slide.placeholders[1].text = "\n".join(lines[1:4])
+            else:
+                slide = prs.slides.add_slide(prs.slide_layouts[1])
+                slide.shapes.title.text = lines[0]
+                body = slide.placeholders[1].text_frame
+                body.text = ""
+                for line in lines[1:]:
+                    clean = line.lstrip("- ").strip()
+                    if clean:
+                        p = body.add_paragraph()
+                        p.text = clean
+                        p.level = 0
+
+        file_path = "presentation.pptx"
+        prs.save(file_path)
+
+        safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
+        await msg.answer_document(
+            FSInputFile(file_path, filename=f"{safe_name}.pptx"),
+            caption=f"📊 Презентация готова: _{topic}_"
+        )
+        await status.delete()
+
+    except Exception as e:
+        logging.error(f"PPTX error: {e}")
+        await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
 
 
 @dp.message()
@@ -457,7 +584,6 @@ async def chat(msg: types.Message):
 
     await bot.send_chat_action(msg.chat.id, "typing")
 
-    # --- Сборка промпта ---
     personal = PERSONAL_PROMPTS.get(user_id, "")
     user_tone = await get_user_tone(user_id)
     tone_addition = f"\n\nПОЖЕЛАНИЯ ПОЛЬЗОВАТЕЛЯ К ТОНУ: {user_tone}" if user_tone else ""
@@ -476,7 +602,6 @@ async def chat(msg: types.Message):
         answer = response.choices[0].message.content
         await save_message(user_id, "assistant", answer)
 
-        # --- Отправка ---
         use_file = (mode == "file") or (len(answer) > 4000)
 
         if use_file:
@@ -501,7 +626,6 @@ async def chat(msg: types.Message):
                 for i, part in enumerate(parts, 1):
                     await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
 
-        # --- Голос ---
         if mode == "voice":
             await bot.send_chat_action(msg.chat.id, "record_voice")
             try:
