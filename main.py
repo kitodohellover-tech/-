@@ -853,4 +853,90 @@ async def chat(msg: types.Message):
     await save_message(user_id, "user", save_text)
     history.append({"role": "user", "content": user_content})
     history = trim_history_by_chars(history)
-    await bot.send
+    await bot.send_chat_action(msg.chat.id, "typing")
+
+    personal = PERSONAL_PROMPTS.get(user_id, "")
+    user_tone = await get_user_tone(user_id)
+    tone_addition = f"\n\nПОЖЕЛАНИЯ К ТОНУ: {user_tone}" if user_tone else ""
+    full_prompt = SYSTEM_PROMPT + personal + tone_addition
+
+    try:
+        response = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {"role": "system", "content": full_prompt},
+                *history
+            ],
+            temperature=0.7,
+            max_tokens=1200,
+        )
+        answer = response.choices[0].message.content
+        await save_message(user_id, "assistant", answer)
+
+        if is_document_edit and doc_info:
+            file_bytes, file_name, ext = doc_info
+            await handle_document_edit(msg, answer, file_bytes, file_name, ext, user_id)
+        else:
+            use_file = (mode == "file") or (len(answer) > 4000)
+            if use_file:
+                ext_out = detect_extension(answer)
+                file_name_out = f"light_answer.{ext_out}"
+                comment = await get_file_comment(f"файл .{ext_out}", "код/ответ", user_id)
+                file_buffer = BytesIO(answer.encode("utf-8"))
+                await msg.answer_document(
+                    BufferedInputFile(file_buffer.read(), filename=file_name_out),
+                    caption=comment
+                )
+            else:
+                parts = split_message(answer)
+                if len(parts) == 1:
+                    await msg.answer(parts[0])
+                else:
+                    for i, part in enumerate(parts, 1):
+                        await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
+
+            if mode == "voice":
+                await bot.send_chat_action(msg.chat.id, "record_voice")
+                try:
+                    voice_file = await text_to_voice(answer)
+                    if voice_file:
+                        await msg.answer_voice(FSInputFile(voice_file))
+                except Exception as e:
+                    logging.error(f"TTS error: {e}")
+
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+        await msg.answer(f"❌ {str(e)[:300]}")
+
+
+# --- Веб-сервер ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+
+async def main():
+    global db_pool
+    logging.basicConfig(level=logging.INFO)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    await init_db()
+    logging.info("База данных подключена")
+
+    if hf_client:
+        logging.info("Hugging Face клиент инициализирован")
+    else:
+        logging.warning("HF_TOKEN не установлен")
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server on port {port}")
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
