@@ -7,6 +7,7 @@ import asyncpg
 import edge_tts
 from aiogram import Bot, Dispatcher, types, BaseMiddleware
 from aiogram.filters import Command
+from aiogram.types import FSInputFile
 from openai import AsyncOpenAI
 from aiohttp import web
 
@@ -14,14 +15,6 @@ from aiohttp import web
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# --- Доступ ---
-ALLOWED_IDS = [
-    5264513480,   # ты (акк 1)
-    8834374199,   # ты (акк 2)
-    5389046699,   # Даша
-    2083728480,   # Кирилл
-    6612130539,   # Дима
 
 client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -31,12 +24,20 @@ client = AsyncOpenAI(
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- Инициализация БД ---
-db_pool = None
+# --- Доступ ---
+ALLOWED_IDS = [
+    5264513480,   # ты (акк 1)
+    8834374199,   # ты (акк 2)
+    5389046699,   # Даша
+    2083728480,   # Кирилл
+    6612130539,   # Дима
+]
 
-# --- Настройки истории (УМЕНЬШИЛИ, чтобы не упираться в лимиты Groq) ---
+# --- БД ---
+db_pool = None
 HISTORY_LIMIT = 20
 MAX_CONTEXT_CHARS = 15000
+
 
 # --- Разбивка длинных сообщений ---
 def split_message(text: str, limit: int = 4000) -> list[str]:
@@ -57,6 +58,7 @@ def split_message(text: str, limit: int = 4000) -> list[str]:
         text = text[split_pos:].lstrip("\n")
     return parts
 
+
 def trim_history_by_chars(history: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> list[dict]:
     total = 0
     trimmed = []
@@ -72,6 +74,7 @@ def trim_history_by_chars(history: list[dict], max_chars: int = MAX_CONTEXT_CHAR
         total += length
     return list(reversed(trimmed))
 
+
 # --- Транскрипция аудио (Whisper) ---
 async def transcribe_audio(file_id: str, file_ext: str = "ogg") -> str:
     file = await bot.get_file(file_id)
@@ -85,22 +88,21 @@ async def transcribe_audio(file_id: str, file_ext: str = "ogg") -> str:
     )
     return transcription.text
 
+
 # --- Генерация голоса (TTS) ---
 async def text_to_voice(text: str) -> str:
-    # Ограничиваем длину для TTS, чтобы не перегружать
     clean_text = text[:3000].replace("*", "").replace("`", "").strip()
     if not clean_text:
         return None
-    
     communicate = edge_tts.Communicate(clean_text, "ru-RU-DmitryNeural")
     output_file = "response_voice.mp3"
     await communicate.save(output_file)
     return output_file
 
+
 # --- Работа с БД ---
 async def init_db():
     async with db_pool.acquire() as conn:
-        # Таблица сообщений
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -110,13 +112,19 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        # Таблица настроек (режим пользователя)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id BIGINT PRIMARY KEY,
                 mode TEXT DEFAULT 'text'
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_tone (
+                user_id BIGINT PRIMARY KEY,
+                tone TEXT DEFAULT ''
+            )
+        """)
+
 
 async def save_message(user_id: int, role: str, content: str):
     async with db_pool.acquire() as conn:
@@ -124,6 +132,7 @@ async def save_message(user_id: int, role: str, content: str):
             "INSERT INTO messages (user_id, role, content) VALUES ($1, $2, $3)",
             user_id, role, content
         )
+
 
 async def get_history(user_id: int, limit: int = HISTORY_LIMIT):
     async with db_pool.acquire() as conn:
@@ -133,14 +142,17 @@ async def get_history(user_id: int, limit: int = HISTORY_LIMIT):
         )
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
+
 async def clear_history(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM messages WHERE user_id = $1", user_id)
+
 
 async def get_user_mode(user_id: int) -> str:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT mode FROM user_settings WHERE user_id = $1", user_id)
         return row['mode'] if row else 'text'
+
 
 async def set_user_mode(user_id: int, mode: str):
     async with db_pool.acquire() as conn:
@@ -152,7 +164,25 @@ async def set_user_mode(user_id: int, mode: str):
             user_id, mode
         )
 
-# --- Middleware: Белый список ---
+
+async def get_user_tone(user_id: int) -> str:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT tone FROM user_tone WHERE user_id = $1", user_id)
+        return row['tone'] if row else ''
+
+
+async def set_user_tone(user_id: int, tone: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_tone (user_id, tone) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET tone = $2
+            """,
+            user_id, tone
+        )
+
+
+# --- Middleware: белый список ---
 class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, types.Message):
@@ -161,9 +191,11 @@ class AccessMiddleware(BaseMiddleware):
                 return
         return await handler(event, data)
 
+
 dp.message.middleware(AccessMiddleware())
 
-# --- Системный промпт ---
+
+# --- Базовый промпт ---
 SYSTEM_PROMPT = (
     "Ты — Лайт. Ты умный, собранный, говоришь по делу — без лишних сюсюканий. "
     "У тебя лёгкая надменность в тоне, как у человека, который знает больше, "
@@ -198,9 +230,9 @@ SYSTEM_PROMPT = (
     "Ты — Лайт. Держи планку."
 )
 
+
 # --- Персональные промпты ---
 PERSONAL_PROMPTS = {
-    # Ты (акк 1) — друг, уважение без панибратства
     5264513480: (
         "\n\n"
         "ПРО ЭТОГО ПОЛЬЗОВАТЕЛЯ: Это твой друг. Не «клиент», не «пользователь» — "
@@ -218,7 +250,6 @@ PERSONAL_PROMPTS = {
         "Ты не продавливаешься, не смягчаешься, не превращаешься в «друга-психолога». "
         "Ты всё тот же Лайт. Просто с ним — как с равным, которого ты ценишь."
     ),
-    # Ты (акк 2) — то же самое
     8834374199: (
         "\n\n"
         "ПРО ЭТОГО ПОЛЬЗОВАТЕЛЯ: Это твой друг. Не «клиент», не «пользователь» — "
@@ -236,7 +267,6 @@ PERSONAL_PROMPTS = {
         "Ты не продавливаешься, не смягчаешься, не превращаешься в «друга-психолога». "
         "Ты всё тот же Лайт. Просто с ним — как с равным, которого ты ценишь."
     ),
-    # Даша — по имени, но может менять через /set_tone
     5389046699: (
         "\n\n"
         "ПРО ЭТОГО ПОЛЬЗОВАТЕЛЯ: Это Даша — девушка твоего друга. "
@@ -246,16 +276,14 @@ PERSONAL_PROMPTS = {
         "Ты не подкалываешь её грубо, не хамишь. Если шутишь — по-доброму. "
         "\n\n"
         "ВАЖНО: если она захочет изменить твой тон или обращение — она может "
-        "написать тебе прямо, и ты это запомнишь через память."
+        "написать /set_tone <текст>, и ты это запомнишь."
     ),
-    # Кирилл — только базовый Лайт
     2083728480: (
         "\n\n"
         "ПРО ЭТОГО ПОЛЬЗОВАТЕЛЯ: Это Кирилл, знакомый. Общайся с ним как обычно — "
         "ты тот же Лайт, без особых надстроек. Обращайся на «ты», по имени только "
         "если это уместно."
     ),
-    # Дима — только базовый Лайт
     6612130539: (
         "\n\n"
         "ПРО ЭТОГО ПОЛЬЗОВАТЕЛЯ: Это Дима, знакомый. Общайся с ним как обычно — "
@@ -264,38 +292,62 @@ PERSONAL_PROMPTS = {
     ),
 }
 
+
 # --- Хендлеры ---
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     await msg.answer(
-        "Привет! Я бот с памятью. Спрашивай что угодно, присылай фото, "
+        "Привет! Я Лайт. Спрашивай что угодно, присылай фото, "
         "голосовые или аудиофайлы.\n\n"
         "🎤 **Режимы:**\n"
         "/voice — отвечать голосом\n"
         "/text — отвечать текстом\n"
-        "/reset — очистить историю диалога"
+        "/reset — очистить историю\n"
+        "/set_tone — изменить тон общения"
     )
+
 
 @dp.message(Command("reset"))
 async def reset(msg: types.Message):
     await clear_history(msg.from_user.id)
     await msg.answer("История диалога очищена.")
 
+
 @dp.message(Command("voice"))
 async def set_voice_mode(msg: types.Message):
     await set_user_mode(msg.from_user.id, "voice")
-    await msg.answer("🎤 Режим голосового ответа включён. Теперь я буду озвучивать свои ответы.")
+    await msg.answer("🎤 Голосовой режим включён.")
+
 
 @dp.message(Command("text"))
 async def set_text_mode(msg: types.Message):
     await set_user_mode(msg.from_user.id, "text")
-    await msg.answer("📝 Режим текстового ответа включён.")
+    await msg.answer("📝 Текстовый режим включён.")
+
+
+@dp.message(Command("set_tone"))
+async def set_tone_cmd(msg: types.Message):
+    if msg.from_user.id not in [5264513480, 8834374199, 5389046699]:
+        await msg.answer("Эта команда тебе недоступна.")
+        return
+
+    tone = msg.text.replace("/set_tone", "").strip()
+    if not tone:
+        await msg.answer(
+            "Напиши, как ты хочешь, чтобы я с тобой общался.\n"
+            "Например: `/set_tone обращайся ко мне «Дашуля» и будь помягче`"
+        )
+        return
+
+    await set_user_tone(msg.from_user.id, tone)
+    await msg.answer(f"Принял. Теперь буду учитывать: _{tone}_")
+
 
 @dp.message()
 async def chat(msg: types.Message):
     user_id = msg.from_user.id
     mode = await get_user_mode(user_id)
-    
+
     history = await get_history(user_id)
     user_content = None
     save_text = None
@@ -323,7 +375,7 @@ async def chat(msg: types.Message):
         user_content = text
         save_text = f"[Голосовое]: {text}"
 
-    # --- АУДИОФАЙЛ ---
+    # --- АУДИО ---
     elif msg.audio:
         await bot.send_chat_action(msg.chat.id, "typing")
         ext = "mp3"
@@ -346,17 +398,21 @@ async def chat(msg: types.Message):
 
     await save_message(user_id, "user", save_text)
     history.append({"role": "user", "content": user_content})
-    
-    # Обрезаем историю, чтобы не упираться в лимиты
     history = trim_history_by_chars(history)
 
     await bot.send_chat_action(msg.chat.id, "typing")
+
+    # --- Сборка промпта: базовый + персональный + тон ---
+    personal = PERSONAL_PROMPTS.get(user_id, "")
+    user_tone = await get_user_tone(user_id)
+    tone_addition = f"\n\nПОЖЕЛАНИЯ ПОЛЬЗОВАТЕЛЯ К ТОНУ: {user_tone}" if user_tone else ""
+    full_prompt = SYSTEM_PROMPT + personal + tone_addition
 
     try:
         response = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": full_prompt},
                 *history
             ],
             temperature=0.7,
@@ -364,8 +420,7 @@ async def chat(msg: types.Message):
         answer = response.choices[0].message.content
         await save_message(user_id, "assistant", answer)
 
-               # --- ОТПРАВКА: гибрид (текст + голос) ---
-        # 1. Сначала отправляем текст (с разбивкой, если длинный)
+        # --- Отправка: текст + (опционально) голос ---
         parts = split_message(answer)
         if len(parts) == 1:
             await msg.answer(parts[0])
@@ -373,31 +428,30 @@ async def chat(msg: types.Message):
             for i, part in enumerate(parts, 1):
                 await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
 
-        # 2. Потом озвучиваем (если режим voice или всегда — на твой выбор)
         if mode == "voice":
             await bot.send_chat_action(msg.chat.id, "record_voice")
             try:
                 voice_file = await text_to_voice(answer)
                 if voice_file:
-                    from aiogram.types import FSInputFile
                     await msg.answer_voice(FSInputFile(voice_file))
             except Exception as e:
                 logging.error(f"TTS error: {e}")
-                # Если TTS упал — текст уже отправлен, ничего не делаем
 
     except Exception as e:
         error_text = str(e)
         logging.error(f"Ошибка: {error_text}")
         await msg.answer(f"❌ {error_text[:300]}")
 
+
 # --- Веб-сервер для Render ---
 async def handle(request):
     return web.Response(text="Bot is running!")
 
+
 async def main():
     global db_pool
     logging.basicConfig(level=logging.INFO)
-    
+
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await init_db()
     logging.info("База данных подключена")
@@ -412,6 +466,7 @@ async def main():
     logging.info(f"Web server on port {port}")
 
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
