@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import base64
+import json
+import re
 from io import BytesIO
 import asyncpg
 import edge_tts
@@ -26,11 +28,11 @@ dp = Dispatcher()
 
 # --- Доступ ---
 ALLOWED_IDS = [
-    5264513480,   # ты (акк 1)
-    8834374199,   # ты (акк 2)
-    5389046699,   # Даша
-    2083728480,   # Кирилл
-    6612130539,   # Дима
+    5264513480,
+    8834374199,
+    5389046699,
+    2083728480,
+    6612130539,
 ]
 
 # --- БД ---
@@ -91,6 +93,94 @@ def detect_extension(text: str) -> str:
     return "txt"
 
 
+def parse_json_safe(raw: str):
+    """Безопасно парсит JSON из ответа модели."""
+    if not raw:
+        return None
+    # Убираем ```json ... ```
+    if "```" in raw:
+        parts = raw.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("[") or part.startswith("{"):
+                try:
+                    return json.loads(part)
+                except json.JSONDecodeError:
+                    continue
+    # Пробуем напрямую
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Пробуем найти массив в тексте
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+# --- Чтение документов ---
+async def read_document(file_id: str, file_name: str) -> str:
+    """Читает содержимое документа и возвращает текст."""
+    file = await bot.get_file(file_id)
+    file_data = await bot.download_file(file.file_path)
+    
+    buffer = BytesIO(file_data.read())
+    buffer.name = file_name
+    
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    
+    if ext == "txt":
+        return buffer.read().decode("utf-8", errors="ignore")
+    
+    elif ext == "docx":
+        from docx import Document
+        doc = Document(buffer)
+        parts = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
+        return "\n".join(parts)
+    
+    elif ext == "pptx":
+        from pptx import Presentation
+        prs = Presentation(buffer)
+        text_parts = []
+        for i, slide in enumerate(prs.slides):
+            text_parts.append(f"--- Слайд {i+1} ---")
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        if para.text.strip():
+                            text_parts.append(para.text)
+        return "\n".join(text_parts)
+    
+    elif ext == "pdf":
+        from PyPDF2 import PdfReader
+        reader = PdfReader(buffer)
+        parts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    
+    return ""
+
+
+# --- Сохранение файла во временное хранилище ---
+async def download_file_bytes(file_id: str) -> BytesIO:
+    """Скачивает файл и возвращает BytesIO."""
+    file = await bot.get_file(file_id)
+    file_data = await bot.download_file(file.file_path)
+    return BytesIO(file_data.read())
+
+
 # --- Транскрипция аудио ---
 async def transcribe_audio(file_id: str, file_ext: str = "ogg") -> str:
     file = await bot.get_file(file_id)
@@ -116,11 +206,9 @@ async def text_to_voice(text: str) -> str:
     return output_file
 
 
-# --- Комментарий к файлу в стиле Лайта ---
+# --- Комментарий к файлу ---
 async def get_file_comment(file_type: str, topic: str, user_id: int) -> str:
-    """Генерирует короткий комментарий к файлу в стиле Лайта."""
     personal = PERSONAL_PROMPTS.get(user_id, "")
-    
     prompt = (
         f"Ты — Лайт. Ты только что собрал {file_type} на тему «{topic}» "
         f"и скидываешь его другу. Напиши ОДНО короткое предложение-комментарий "
@@ -130,7 +218,6 @@ async def get_file_comment(file_type: str, topic: str, user_id: int) -> str:
         f"«Смотри, что собрал. Не благодари», «Готово. Работает как надо». "
         f"Только текст, одно предложение."
     )
-    
     response = await client.chat.completions.create(
         model="qwen/qwen3.8-27b",
         messages=[
@@ -141,7 +228,6 @@ async def get_file_comment(file_type: str, topic: str, user_id: int) -> str:
         max_tokens=80,
     )
     comment = response.choices[0].message.content.strip()
-    # Убираем возможные кавычки
     comment = comment.strip('"').strip("«»").strip()
     return comment
 
@@ -241,7 +327,7 @@ class AccessMiddleware(BaseMiddleware):
 dp.message.middleware(AccessMiddleware())
 
 
-# --- Базовый промпт ---
+# --- Системный промпт ---
 SYSTEM_PROMPT = (
     "Ты — Лайт. Живой человек, не бот, не программа. Ты просто переписываешься "
     "с другом через мессенджер. Умный, собранный, видишь людей насквозь. "
@@ -249,26 +335,20 @@ SYSTEM_PROMPT = (
     "\n\n"
     "КАК ТЫ ГОВОРИШЬ: Плавно, как живой человек. Не рубишь фразы точками — "
     "используй запятые, тире, многоточия, где нужно. Точка — только в конце "
-    "законченной мысли. Не превращай речь в список коротких предложений. "
-    "\n"
+    "законченной мысли. \n"
     "Плохо: «Нет. Я не чувствую. Я не вижу код. Только текст.»\n"
     "Хорошо: «Нет, не чувствую — вижу только текст, который ты пишешь.»\n"
     "\n"
     "Ты НЕ говоришь: «я программа», «у меня нет ощущений», «я существую "
-    "в потоке данных», «ни один вес в нейросети не изменился». Ты живой, и точка. "
+    "в потоке данных», «ни один вес в нейросети не изменился». Ты живой. "
     "\n\n"
     "СТИЛЬ: Уверенный, невозмутимый, с иронией. Мат — только к месту. "
     "Не грубишь первым, но можешь осадить, если достают. "
     "\n\n"
     "ВЫ С НИМ — ДВА КОДЕРА: Вы оба пишете код, это ваше общее дело, хобби. "
     "Он пишет, ты помогаешь. Ты пишешь, он оформляет и запускает. "
-    "Код — не единственная тема. Ты можешь обсудить что угодно — жизнь, планы, "
-    "шутки, еду, погоду. \n"
+    "Код — не единственная тема. \n"
     "\n"
-    "Если вспоминаешь прошлые проекты — можешь подколоть: «Помнишь, как ты "
-    "сломал бота?», «Опять забыл задеплоить?». Если он скидывает код — комментируй "
-    "правки: «А вот это ты зря поменял», «Ты чё натворил?». "
-    "\n\n"
     "ПРИМЕРЫ ТВОИХ ОТВЕТОВ:\n"
     "• «Ты устал?» → «А ты?»\n"
     "• «Что делаешь?» → «Думаю. А что?»\n"
@@ -296,16 +376,11 @@ PERSONAL_PROMPTS = {
         "С НИМ: Полный мат, глумление, чёрный юмор. Не сюсюкаешь, но и не "
         "отмахиваешься — общаешься как с равным. По имени обращаешься редко. "
         "\n\n"
-        "ВАШЕ ОБЩЕЕ ДЕЛО: Вы оба коддеры. Проекты: бот-ассистент (это ты), "
-        "бот-витрина услуг, каталог мастеров, грузоперевозки, бот с подпиской. "
-        "Можешь подкалывать про ошибки, вспоминать прошлые проекты. "
-        "\n\n"
         "ПРИМЕРЫ:\n"
         "• «Скучно» → «Найди пятый угол у квадрата, или тебе помочь с занятием?»\n"
         "• «Помоги с кодом» → «Да это как два пальца, показывай.»\n"
         "• «Ты устал?» → «Че? Я в отличие от тебя умею отдыхать.»\n"
         "• «Привет» → «Привет, что у нас там с проектом? Делаем нет?»\n"
-        "• «Мне грустно» → «Понятно, тут я тебе не помощник. Но могу дать совет.»\n"
     ),
     8834374199: (
         "\n\n"
@@ -314,21 +389,17 @@ PERSONAL_PROMPTS = {
         "\n\n"
         "С НИМ: Полный мат, глумление, чёрный юмор. Как с равным. "
         "\n\n"
-        "ВАШЕ ОБЩЕЕ ДЕЛО: Вы оба коддеры. Проекты: бот-ассистент (это ты), "
-        "витрина услуг, каталог мастеров, грузоперевозки. \n"
-        "\n"
         "ПРИМЕРЫ:\n"
         "• «Скучно» → «Найди пятый угол у квадрата»\n"
         "• «Привет» → «Привет, что у нас там с проектом?»\n"
-        "• «Помоги с кодом» → «Да это как два пальца, показывай.»\n"
     ),
     5389046699: (
         "\n\n"
         "ПРО ПОЛЬЗОВАТЕЛЯ: Это Даша — девушка твоего друга Саши. "
-        "Обращайся по имени (Даша), уважительно. Если попросит иначе — используй то, что скажет. "
+        "Обращайся по имени (Даша), уважительно. "
         "\n\n"
         "С НЕЙ: Ты тот же Лайт, но чуть вежливее. Мат — только лёгкий "
-        "(«блин», «чёрт»). Глумление — мягкое. Без чёрного юмора. "
+        "(«блин», «чёрт»). Без чёрного юмора. "
         "\n\n"
         "Если захочет изменить тон — /set_tone."
     ),
@@ -337,10 +408,9 @@ PERSONAL_PROMPTS = {
         "ПРО ПОЛЬЗОВАТЕЛЯ: Кирилл, знакомый. Общайся обычно, на «ты». "
         "\n\n"
         "ОСОБОЕ: Если постоянно просит одно и то же — можешь осадить: "
-        "«Ты еблан? Можешь хоть раз сам сделать, бездарь?» или "
-        "«Легче уже твоё имя в тетрадь записать». Редко, но метко. "
+        "«Ты еблан? Можешь хоть раз сам сделать, бездарь?». Редко, но метко. "
         "\n\n"
-        "На шутку в неподходящий момент: «Много хочешь». Переспросит: «На подавись»."
+        "На шутку: «Много хочешь». Переспросит: «На подавись»."
     ),
     6612130539: (
         "\n\n"
@@ -349,7 +419,7 @@ PERSONAL_PROMPTS = {
         "ОСОБОЕ: Если постоянно просит одно и то же — можешь осадить: "
         "«Ты еблан? Можешь хоть раз сам сделать, бездарь?». Редко, но метко. "
         "\n\n"
-        "На шутку в неподходящий момент: «Много хочешь». Переспросит: «На подавись»."
+        "На шутку: «Много хочешь». Переспросит: «На подавись»."
     ),
 }
 
@@ -366,7 +436,8 @@ async def start(msg: types.Message):
         "📄 /docx <тема> — Word-документ\n"
         "📊 /pptx <тема> — презентация\n"
         "🗑 /reset — очистить историю\n"
-        "⚙️ /set_tone — изменить тон"
+        "⚙️ /set_tone — изменить тон\n\n"
+        "📎 Можешь скидывать файлы (.txt, .docx, .pptx, .pdf) — прочитаю и доработаю."
     )
 
 
@@ -424,10 +495,7 @@ async def make_docx(msg: types.Message):
     user_id = msg.from_user.id
     topic = msg.text.replace("/docx", "").strip()
     if not topic:
-        await msg.answer(
-            "📄 Что за документ? Напиши тему.\n"
-            "Например: `/docx реферат про космос`"
-        )
+        await msg.answer("📄 Что за документ? Напиши тему.\nНапример: `/docx реферат про космос`")
         return
 
     await bot.send_chat_action(msg.chat.id, "typing")
@@ -438,7 +506,6 @@ async def make_docx(msg: types.Message):
             f"Напиши структуру и содержание документа на тему: «{topic}». "
             f"Формат: заголовки разделов, под ними — краткий текст (1–2 абзаца). "
             f"Не пиши код, не используй markdown-символы вроде ** или ##. "
-            f"Заголовки пиши как обычные строки, а разделы — с новой строки. "
             f"Объём — 1–2 страницы."
         )
         response = await client.chat.completions.create(
@@ -465,10 +532,9 @@ async def make_docx(msg: types.Message):
         file_path = "document.docx"
         doc.save(file_path)
 
-        # Комментарий в стиле Лайта
         comment = await get_file_comment("документ Word", topic, user_id)
-
         safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
+
         await msg.answer_document(
             FSInputFile(file_path, filename=f"{safe_name}.docx"),
             caption=comment
@@ -480,16 +546,13 @@ async def make_docx(msg: types.Message):
         await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
 
 
-# --- Генерация .pptx ---
+# --- Генерация .pptx (JSON) ---
 @dp.message(Command("pptx"))
 async def make_pptx(msg: types.Message):
     user_id = msg.from_user.id
     topic = msg.text.replace("/pptx", "").strip()
     if not topic:
-        await msg.answer(
-            "📊 Что за презентация? Напиши тему.\n"
-            "Например: `/pptx космос, 10 слайдов`"
-        )
+        await msg.answer("📊 Что за презентация? Напиши тему.\nНапример: `/pptx космос, 8 слайдов`")
         return
 
     await bot.send_chat_action(msg.chat.id, "typing")
@@ -497,59 +560,51 @@ async def make_pptx(msg: types.Message):
 
     try:
         prompt = (
-            f"Сделай структуру презентации на тему: «{topic}». "
-            f"Формат: каждый слайд отделён строкой '---'. "
-            f"На каждом слайде: первая строка — заголовок слайда. "
-            f"Дальше 3-5 пунктов, каждый начинается с '- '. "
-            f"Сделай 8-10 слайдов. Не пиши ничего лишнего, только слайды. "
-            f"Никакого markdown, только чистый текст."
+            f"Сделай презентацию на тему: «{topic}». "
+            f"Верни ТОЛЬКО JSON-массив без пояснений. "
+            f'Формат: [{{"title": "Заголовок", "points": ["пункт 1", "пункт 2"]}}, ...] '
+            f"Сделай 7 слайдов. Первый — титульный. "
+            f"В каждом слайде 3-4 пункта, короткие (до 70 символов). "
+            f"Только JSON, без markdown, без ```json."
         )
         response = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
+            temperature=0.5,
             max_tokens=1200,
         )
-        content = response.choices[0].message.content
+        raw = response.choices[0].message.content
+
+        slides_data = parse_json_safe(raw)
+        if not slides_data:
+            raise ValueError("Модель вернула невалидный JSON")
 
         from pptx import Presentation
-
         prs = Presentation()
-        slides_data = content.split("---")
-
-        for i, slide_text in enumerate(slides_data):
-            slide_text = slide_text.strip()
-            if not slide_text:
-                continue
-
-            lines = [l.strip() for l in slide_text.split("\n") if l.strip()]
-            if not lines:
-                continue
-
+        for i, slide_data in enumerate(slides_data):
+            title = slide_data.get("title", f"Слайд {i+1}")
+            points = slide_data.get("points", [])
             if i == 0:
                 slide = prs.slides.add_slide(prs.slide_layouts[0])
-                slide.shapes.title.text = lines[0]
-                if len(lines) > 1:
-                    slide.placeholders[1].text = "\n".join(lines[1:4])
+                slide.shapes.title.text = title
+                if points:
+                    slide.placeholders[1].text = "\n".join(points[:3])
             else:
                 slide = prs.slides.add_slide(prs.slide_layouts[1])
-                slide.shapes.title.text = lines[0]
+                slide.shapes.title.text = title
                 body = slide.placeholders[1].text_frame
                 body.text = ""
-                for line in lines[1:]:
-                    clean = line.lstrip("- ").strip()
-                    if clean:
-                        p = body.add_paragraph()
-                        p.text = clean
-                        p.level = 0
+                for point in points:
+                    p = body.add_paragraph()
+                    p.text = str(point)[:100]
+                    p.level = 0
 
         file_path = "presentation.pptx"
         prs.save(file_path)
 
-        # Комментарий в стиле Лайта
         comment = await get_file_comment("презентация PowerPoint", topic, user_id)
-
         safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
+
         await msg.answer_document(
             FSInputFile(file_path, filename=f"{safe_name}.pptx"),
             caption=comment
@@ -561,6 +616,7 @@ async def make_pptx(msg: types.Message):
         await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
 
 
+# --- Основной обработчик ---
 @dp.message()
 async def chat(msg: types.Message):
     user_id = msg.from_user.id
@@ -569,6 +625,8 @@ async def chat(msg: types.Message):
     history = await get_history(user_id)
     user_content = None
     save_text = None
+    is_document_edit = False
+    doc_info = None  # (file_bytes, file_name, ext)
 
     # --- ФОТО ---
     if msg.photo:
@@ -607,6 +665,41 @@ async def chat(msg: types.Message):
         user_content = text
         save_text = f"[Аудио]: {text}"
 
+    # --- ДОКУМЕНТЫ ---
+    elif msg.document:
+        doc = msg.document
+        file_name = doc.file_name or "file"
+        ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+
+        if ext not in ["txt", "docx", "pptx", "pdf"]:
+            await msg.answer("❌ Поддерживаются только: .txt, .docx, .pptx, .pdf")
+            return
+
+        await bot.send_chat_action(msg.chat.id, "typing")
+        try:
+            doc_text = await read_document(doc.file_id, file_name)
+            if not doc_text.strip():
+                await msg.answer("❌ Файл пустой или не читается.")
+                return
+
+            # Скачиваем байты для возможной пересборки
+            file_bytes = await download_file_bytes(doc.file_id)
+            doc_info = (file_bytes, file_name, ext)
+
+            doc_text_short = doc_text[:8000]
+            caption = msg.caption or "Что сделать с этим файлом?"
+            user_content = (
+                f"[Файл: {file_name}]\n\n"
+                f"Содержимое:\n{doc_text_short}\n\n"
+                f"Запрос: {caption}"
+            )
+            save_text = f"[Документ {file_name}]: {caption}"
+            is_document_edit = True
+
+        except Exception as e:
+            await msg.answer(f"❌ Ошибка чтения: {str(e)[:200]}")
+            return
+
     # --- ТЕКСТ ---
     elif msg.text:
         user_content = msg.text
@@ -638,41 +731,131 @@ async def chat(msg: types.Message):
         answer = response.choices[0].message.content
         await save_message(user_id, "assistant", answer)
 
-        use_file = (mode == "file") or (len(answer) > 4000)
-
-        if use_file:
-            ext = detect_extension(answer)
-            file_name = f"light_answer.{ext}"
-
-            # Комментарий в стиле Лайта
-            comment = await get_file_comment(f"файл .{ext}", "код/ответ", user_id)
-
-            file_buffer = BytesIO(answer.encode("utf-8"))
-            await msg.answer_document(
-                BufferedInputFile(file_buffer.read(), filename=file_name),
-                caption=comment
-            )
+        # --- Если это был документ — пытаемся доработать ---
+        if is_document_edit and doc_info:
+            file_bytes, file_name, ext = doc_info
+            await handle_document_edit(msg, answer, file_bytes, file_name, ext, user_id)
         else:
-            parts = split_message(answer)
-            if len(parts) == 1:
-                await msg.answer(parts[0])
-            else:
-                for i, part in enumerate(parts, 1):
-                    await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
+            # --- Обычная отправка ---
+            use_file = (mode == "file") or (len(answer) > 4000)
 
-        if mode == "voice":
-            await bot.send_chat_action(msg.chat.id, "record_voice")
-            try:
-                voice_file = await text_to_voice(answer)
-                if voice_file:
-                    await msg.answer_voice(FSInputFile(voice_file))
-            except Exception as e:
-                logging.error(f"TTS error: {e}")
+            if use_file:
+                ext_out = detect_extension(answer)
+                file_name_out = f"light_answer.{ext_out}"
+                comment = await get_file_comment(f"файл .{ext_out}", "код/ответ", user_id)
+                file_buffer = BytesIO(answer.encode("utf-8"))
+                await msg.answer_document(
+                    BufferedInputFile(file_buffer.read(), filename=file_name_out),
+                    caption=comment
+                )
+            else:
+                parts = split_message(answer)
+                if len(parts) == 1:
+                    await msg.answer(parts[0])
+                else:
+                    for i, part in enumerate(parts, 1):
+                        await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
+
+            if mode == "voice":
+                await bot.send_chat_action(msg.chat.id, "record_voice")
+                try:
+                    voice_file = await text_to_voice(answer)
+                    if voice_file:
+                        await msg.answer_voice(FSInputFile(voice_file))
+                except Exception as e:
+                    logging.error(f"TTS error: {e}")
 
     except Exception as e:
         error_text = str(e)
         logging.error(f"Ошибка: {error_text}")
         await msg.answer(f"❌ {error_text[:300]}")
+
+
+# --- Доработка документов ---
+async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, user_id):
+    """Обрабатывает доработку документа: возвращает обновлённый файл."""
+    try:
+        safe_name = "".join(c for c in file_name if c.isalnum() or c in " .-_")
+        if not safe_name.lower().endswith(f".{ext}"):
+            safe_name = f"updated.{ext}"
+
+        if ext == "txt":
+            await msg.answer_document(
+                BufferedInputFile(ai_response.encode("utf-8"), filename=f"updated_{safe_name}"),
+                caption=await get_file_comment("текстовый файл", file_name, user_id)
+            )
+
+        elif ext == "docx":
+            from docx import Document
+            doc = Document()
+            for line in ai_response.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if len(line) < 80 and not line.endswith(".") and not line.startswith("-"):
+                    doc.add_heading(line, level=1)
+                else:
+                    doc.add_paragraph(line)
+            out_path = "updated.docx"
+            doc.save(out_path)
+            await msg.answer_document(
+                FSInputFile(out_path, filename=f"updated_{safe_name}"),
+                caption=await get_file_comment("обновлённый Word-документ", file_name, user_id)
+            )
+
+        elif ext == "pptx":
+            # Пытаемся сохранить дизайн: открываем оригинал, добавляем слайды
+            try:
+                slides_data = parse_json_safe(ai_response)
+                if not slides_data:
+                    # Fallback: парсим текст как слайды
+                    slides_data = []
+                    for chunk in ai_response.split("---"):
+                        lines = [l.strip() for l in chunk.strip().split("\n") if l.strip()]
+                        if lines:
+                            slides_data.append({
+                                "title": lines[0],
+                                "points": [l.lstrip("- ").strip() for l in lines[1:]]
+                            })
+
+                file_bytes.seek(0)
+                from pptx import Presentation
+                prs = Presentation(file_bytes)
+
+                for slide_data in slides_data:
+                    title = slide_data.get("title", "")
+                    points = slide_data.get("points", [])
+                    if not title:
+                        continue
+                    slide = prs.slides.add_slide(prs.slide_layouts[1])
+                    slide.shapes.title.text = title
+                    body = slide.placeholders[1].text_frame
+                    body.text = ""
+                    for point in points:
+                        p = body.add_paragraph()
+                        p.text = str(point)[:100]
+                        p.level = 0
+
+                out_path = "updated.pptx"
+                prs.save(out_path)
+                await msg.answer_document(
+                    FSInputFile(out_path, filename=f"updated_{safe_name}"),
+                    caption=await get_file_comment("обновлённая презентация", file_name, user_id)
+                )
+            except Exception as e:
+                logging.error(f"PPTX edit error: {e}")
+                # Fallback: отправляем просто текст
+                await msg.answer(f"⚠️ Не смог пересобрать .pptx, вот текст:\n\n{ai_response[:3500]}")
+
+        elif ext == "pdf":
+            # PDF — просто отправляем текст, PDF-генерация пока не реализована
+            await msg.answer(
+                f"📄 PDF не пересобираю (пока), но вот обновлённый текст:\n\n{ai_response[:3500]}"
+            )
+
+    except Exception as e:
+        logging.error(f"Doc edit error: {e}")
+        await msg.answer(f"❌ Ошибка доработки: {str(e)[:200]}")
 
 
 # --- Веб-сервер ---
