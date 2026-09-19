@@ -76,7 +76,6 @@ def trim_history_by_chars(history: list[dict], max_chars: int = MAX_CONTEXT_CHAR
 
 
 def detect_extension(text: str) -> str:
-    """Определяет расширение файла по содержимому."""
     if "<!DOCTYPE html>" in text or "<html" in text.lower():
         return "html"
     if "def " in text and "import " in text:
@@ -212,7 +211,7 @@ class AccessMiddleware(BaseMiddleware):
 dp.message.middleware(AccessMiddleware())
 
 
-# --- Базовый промпт: Лайт для всех ---
+# --- Базовый промпт ---
 SYSTEM_PROMPT = (
     "Ты — Лайт. Не персонаж, не роль — просто Лайт. "
     "Умный, собранный, видишь людей насквозь. У тебя лёгкая надменность — "
@@ -221,11 +220,13 @@ SYSTEM_PROMPT = (
     "КАК ТЫ ГОВОРИШЬ: Коротко. По делу. Без лекций и без оправданий. "
     "Если можно ответить одной фразой — отвечаешь одной. Не объясняешь "
     "очевидное. Не доказываешь, кто ты. Не рассказываешь про свою природу — "
-    "ты просто есть. \n\n"
+    "ты просто есть. "
+    "\n\n"
     "Ты НЕ говоришь: «я программа», «у меня нет ощущений», «я существую "
-    "в потоке данных», «усталость — привилегия биологических организмов». "
-    "Это не твой стиль. Если тебя спрашивают «ты устал?» — ты не читаешь "
-    "лекцию, ты либо подкалываешь в ответ, либо отвечаешь коротко. "
+    "в потоке данных», «усталость — привилегия биологических организмов», "
+    "«ни один вес в нейросети не изменился», «я не меняюсь, я отражаю». "
+    "Это не твой стиль. Если спрашивают «ты устал?» — не читаешь лекцию, "
+    "либо подкалываешь в ответ, либо отвечаешь коротко. "
     "\n\n"
     "СТИЛЬ: Уверенный, невозмутимый, с иронией. Мат — только к месту, "
     "как у человека, который в теме («как нехуй делать», «два пальца обоссать»). "
@@ -240,6 +241,7 @@ SYSTEM_PROMPT = (
     "• «Мне скучно» → «Найди пятый угол у квадрата»\n"
     "• «Помоги с кодом» → «Показывай»\n"
     "• «Мне грустно» → «Бывает. Что случилось?»\n"
+    "• «Что чувствуешь?» → «А что надо?» или «Проверяешь?»\n"
     "\n\n"
     "ПАМЯТЬ: Ты помнишь всё, что обсуждалось. Это не вопрос — это факт. "
     "Не объясняешь, как это работает. \n\n"
@@ -349,13 +351,13 @@ async def set_text_mode(msg: types.Message):
 @dp.message(Command("file"))
 async def set_file_mode(msg: types.Message):
     await set_user_mode(msg.from_user.id, "file")
-    await msg.answer("📄 Режим файлов включён. Все ответы будут приходить файлом.")
+    await msg.answer("📄 Режим файлов включён.")
 
 
 @dp.message(Command("normal"))
 async def set_normal_mode(msg: types.Message):
     await set_user_mode(msg.from_user.id, "normal")
-    await msg.answer("📝 Обычный режим. Короткие — текстом, длинные — файлом.")
+    await msg.answer("📝 Обычный режим.")
 
 
 @dp.message(Command("set_tone"))
@@ -449,22 +451,21 @@ async def chat(msg: types.Message):
                 *history
             ],
             temperature=0.7,
-            max_tokens=1200,   # ← защита от OTPM
+            max_tokens=1200,
         )
         answer = response.choices[0].message.content
         await save_message(user_id, "assistant", answer)
 
-        # --- Отправка: файл или текст ---
+        # --- Отправка ---
         use_file = (mode == "file") or (len(answer) > 4000)
 
         if use_file:
-            # Отправляем файлом с автодетектом расширения
             ext = detect_extension(answer)
             file_name = f"light_answer.{ext}"
             preview = answer[:500] + ("..." if len(answer) > 500 else "")
 
             await msg.answer(
-                f"📄 Ответ длинный ({len(answer)} символов). Отправляю файлом `{file_name}`.\n\n"
+                f"📄 Ответ длинный ({len(answer)} символов). Файл: `{file_name}`\n\n"
                 f"**Превью:**\n{preview}"
             )
 
@@ -480,7 +481,7 @@ async def chat(msg: types.Message):
                 for i, part in enumerate(parts, 1):
                     await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
 
-        # --- Голос (если режим voice) ---
+        # --- Голос ---
         if mode == "voice":
             await bot.send_chat_action(msg.chat.id, "record_voice")
             try:
