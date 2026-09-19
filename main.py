@@ -4,10 +4,12 @@ import os
 import base64
 import json
 import re
+import io
 from io import BytesIO
 import asyncpg
 import edge_tts
 import aiohttp
+from huggingface_hub import InferenceClient
 from aiogram import Bot, Dispatcher, types, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, BufferedInputFile
@@ -18,11 +20,15 @@ from aiohttp import web
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_KEY,
 )
+
+# --- Hugging Face клиент ---
+hf_client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else None
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -121,31 +127,36 @@ def parse_json_safe(raw: str):
     return None
 
 
-# --- Pollinations ---
+# --- Генерация картинки (Hugging Face) ---
 async def generate_image(prompt: str) -> BytesIO | None:
-    """Генерирует картинку через Pollinations.ai."""
+    """Генерирует картинку через Hugging Face Inference API (FLUX.1-schnell)."""
+    if not hf_client:
+        logging.error("[HF] HF_TOKEN не установлен")
+        return None
+
     try:
-        clean_prompt = re.sub(r'[^\w\s,\-\.]', '', prompt)[:200]
-        encoded = clean_prompt.replace(" ", "%20")
-        url = (
-            f"https://image.pollinations.ai/prompt/{encoded}"
-            f"?width=1024&height=768&nologo=true&model=flux"
-        )
-        logging.info(f"[Pollinations] Request: {url[:120]}")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-                logging.info(f"[Pollinations] Status: {resp.status}")
-                if resp.status == 200:
-                    data = await resp.read()
-                    logging.info(f"[Pollinations] Size: {len(data)} bytes")
-                    if len(data) > 1000:
-                        return BytesIO(data)
-        return None
-    except asyncio.TimeoutError:
-        logging.error(f"[Pollinations] Timeout for: {prompt[:50]}")
-        return None
+        loop = asyncio.get_event_loop()
+
+        def _generate():
+            try:
+                logging.info(f"[HF] Request: {prompt[:60]}...")
+                image = hf_client.text_to_image(
+                    prompt=prompt[:200],
+                    model="black-forest-labs/FLUX.1-schnell",
+                )
+                img_bytes = io.BytesIO()
+                image.save(img_bytes, format="PNG")
+                img_bytes.seek(0)
+                logging.info(f"[HF] OK: {len(img_bytes.getvalue())} bytes")
+                return img_bytes
+            except Exception as e:
+                logging.error(f"[HF] Error: {str(e)[:200]}")
+                return None
+
+        result = await loop.run_in_executor(None, _generate)
+        return result
     except Exception as e:
-        logging.error(f"[Pollinations] Error: {e}")
+        logging.error(f"[HF] Outer error: {str(e)[:200]}")
         return None
 
 
@@ -508,7 +519,7 @@ async def make_docx(msg: types.Message):
         await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
 
 
-# --- Генерация .pptx с параллельными картинками ---
+# --- Генерация .pptx с картинками (HF) ---
 @dp.message(Command("pptx"))
 async def make_pptx(msg: types.Message):
     user_id = msg.from_user.id
@@ -526,10 +537,10 @@ async def make_pptx(msg: types.Message):
         prompt = (
             f"Сделай презентацию на тему: «{topic}». "
             f"Верни ТОЛЬКО JSON-массив без пояснений. "
-            f'Формат: [{{"title": "Заголовок", "points": ["пункт 1", "пункт 2"], "image_prompt": "english prompt for image"}}, ...] '
+            f'Формат: [{{"title": "Заголовок", "points": ["пункт 1", "пункт 2"], "image_prompt": "english prompt"}}, ...] '
             f"Сделай РОВНО 8 слайдов. Первый — титульный. "
             f"В каждом слайде 5-6 пунктов, до 120 символов. "
-            f"image_prompt — короткое описание картинки на английском (для Pollinations). "
+            f"image_prompt — короткое описание картинки на английском. "
             f"Только JSON, без markdown."
         )
         response = await client.chat.completions.create(
@@ -546,20 +557,20 @@ async def make_pptx(msg: types.Message):
         total = len(slides_data)
         logging.info(f"[PPTX] Slides: {total}")
 
-        # 2. Все картинки ПАРАЛЛЕЛЬНО
-        await status.edit_text(f"📊 Генерирую {total} картинок параллельно...")
+        # 2. Картинки параллельно (HF)
+        await status.edit_text(f"📊 Генерирую {total} картинок...")
         image_prompts = [s.get("image_prompt", s.get("title", "abstract")) for s in slides_data]
-        logging.info(f"[PPTX] Image prompts: {image_prompts[:3]}...")
-        
+        logging.info(f"[PPTX] Image prompts: {image_prompts[:2]}...")
+
         images = await asyncio.gather(
             *[generate_image(p) for p in image_prompts],
             return_exceptions=True
         )
-        
+
         success_count = sum(1 for img in images if isinstance(img, BytesIO))
         logging.info(f"[PPTX] Images generated: {success_count}/{total}")
 
-        # 3. Собираем pptx
+        # 3. Сборка pptx
         await status.edit_text(f"📊 Собираю презентацию ({success_count}/{total} картинок)...")
         from pptx import Presentation
         from pptx.util import Inches, Pt
@@ -576,14 +587,12 @@ async def make_pptx(msg: types.Message):
             blank_layout = prs.slide_layouts[6]
             slide = prs.slides.add_slide(blank_layout)
 
-            # Заголовок
             title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
             title_frame = title_box.text_frame
             title_frame.text = title
             title_frame.paragraphs[0].font.size = Pt(28)
             title_frame.paragraphs[0].font.bold = True
 
-            # Текст
             text_box = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(5), Inches(5.5))
             text_frame = text_box.text_frame
             text_frame.word_wrap = True
@@ -592,7 +601,6 @@ async def make_pptx(msg: types.Message):
                 p.text = f"• {point}"
                 p.font.size = Pt(14)
 
-            # Картинка
             if img_bytes:
                 img_bytes.seek(0)
                 try:
@@ -866,6 +874,11 @@ async def main():
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     await init_db()
     logging.info("База данных подключена")
+
+    if hf_client:
+        logging.info("Hugging Face клиент инициализирован")
+    else:
+        logging.warning("HF_TOKEN не установлен — картинки не будут генерироваться")
 
     app = web.Application()
     app.router.add_get("/", handle)
