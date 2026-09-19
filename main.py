@@ -27,7 +27,6 @@ client = AsyncOpenAI(
     api_key=GROQ_KEY,
 )
 
-# --- Hugging Face клиент ---
 hf_client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else None
 
 bot = Bot(token=BOT_TOKEN)
@@ -127,6 +126,36 @@ def parse_json_safe(raw: str):
     return None
 
 
+# --- Автоперевод промпта на английский ---
+async def translate_to_english(text: str) -> str:
+    """Переводит русский промпт на английский для лучшего понимания моделью."""
+    try:
+        response = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты переводчик для генерации изображений. "
+                        "Переведи текст пользователя на английский язык. "
+                        "Сохрани ВСЕ детали: цвета, объекты, стиль, настроение, время года. "
+                        "Верни ТОЛЬКО перевод, без пояснений, без кавычек, без markdown."
+                    )
+                },
+                {"role": "user", "content": text}
+            ],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        translated = response.choices[0].message.content.strip()
+        translated = translated.strip('"').strip("'").strip()
+        logging.info(f"[TRANSLATE] '{text[:50]}' → '{translated[:80]}'")
+        return translated
+    except Exception as e:
+        logging.error(f"[TRANSLATE] Error: {e}")
+        return text  # Fallback — возвращаем как есть
+
+
 # --- Генерация картинки (Hugging Face) ---
 async def generate_image(prompt: str) -> BytesIO | None:
     """Генерирует картинку через Hugging Face Inference API (FLUX.1-schnell)."""
@@ -139,7 +168,7 @@ async def generate_image(prompt: str) -> BytesIO | None:
 
         def _generate():
             try:
-                logging.info(f"[HF] Request: {prompt[:60]}...")
+                logging.info(f"[HF] Request (EN): {prompt[:80]}...")
                 image = hf_client.text_to_image(
                     prompt=prompt[:200],
                     model="black-forest-labs/FLUX.1-schnell",
@@ -228,11 +257,11 @@ async def text_to_voice(text: str) -> str:
 async def get_file_comment(file_type: str, topic: str, user_id: int) -> str:
     personal = PERSONAL_PROMPTS.get(user_id, "")
     prompt = (
-        f"Ты — Лайт. Ты только что собрал {file_type} на тему «{topic}» "
+        f"Ты — Лайт. Ты только что сгенерировал {file_type} на тему «{topic}» "
         f"и скидываешь его другу. Напиши ОДНО короткое предложение-комментарий "
-        f"в своём стиле: с лёгкой иронией, как будто скидываешь файл из редактора. "
-        f"Без markdown, без кавычек. Примеры: «Держи. Накидал по быстрому», "
-        f"«Смотри, что собрал», «Готово. Работает как надо». Только текст."
+        f"в своём стиле: с лёгкой иронией. "
+        f"НЕ используй слово «собрал» — используй «нарисовал», «сделал», «сгенерил», «готово». "
+        f"Без markdown, без кавычек. Только текст."
     )
     response = await client.chat.completions.create(
         model="qwen/qwen3.8-27b",
@@ -467,7 +496,7 @@ async def set_tone_cmd(msg: types.Message):
     await msg.answer(f"Принял. Теперь буду учитывать: _{tone}_")
 
 
-# --- Генерация картинки ---
+# --- Генерация картинки (с автопереводом) ---
 @dp.message(Command("image"))
 async def make_image(msg: types.Message):
     user_id = msg.from_user.id
@@ -480,10 +509,16 @@ async def make_image(msg: types.Message):
         return
 
     await bot.send_chat_action(msg.chat.id, "upload_photo")
-    status = await msg.answer(f"🎨 Генерирую: _{prompt}_...\nЭто займёт 20-60 секунд.")
+    status = await msg.answer(f"🎨 Генерирую: _{prompt}_...\nПеревожу и рисую, 20-60 секунд.")
 
     try:
-        img_bytes = await generate_image(prompt)
+        # Автоперевод на английский
+        await status.edit_text(f"🌐 Перевожу промпт на английский...")
+        prompt_en = await translate_to_english(prompt)
+
+        await status.edit_text(f"🎨 Рисую: _{prompt_en[:60]}_...\n20-60 секунд.")
+
+        img_bytes = await generate_image(prompt_en)
         if not img_bytes:
             await status.edit_text("❌ Не удалось сгенерировать. Попробуй позже или измени промпт.")
             return
@@ -555,7 +590,7 @@ async def make_docx(msg: types.Message):
         await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
 
 
-# --- Генерация .pptx с картинками (HF) ---
+# --- Генерация .pptx с картинками ---
 @dp.message(Command("pptx"))
 async def make_pptx(msg: types.Message):
     user_id = msg.from_user.id
@@ -575,7 +610,7 @@ async def make_pptx(msg: types.Message):
             f'Формат: [{{"title": "Заголовок", "points": ["пункт 1", "пункт 2"], "image_prompt": "english prompt"}}, ...] '
             f"Сделай РОВНО 8 слайдов. Первый — титульный. "
             f"В каждом слайде 5-6 пунктов, до 120 символов. "
-            f"image_prompt — короткое описание картинки на английском. "
+            f"image_prompt — короткое описание картинки НА АНГЛИЙСКОМ. "
             f"Только JSON, без markdown."
         )
         response = await client.chat.completions.create(
@@ -754,7 +789,7 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, use
                 caption=await get_file_comment("обновлённая презентация", file_name, user_id)
             )
 
-        elif ext == "pdf":
+elif ext == "pdf":
             await msg.answer(f"📄 PDF не пересобираю, вот текст:\n\n{ai_response[:3500]}")
 
     except Exception as e:
