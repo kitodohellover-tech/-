@@ -6,3 +6,5 @@ edge-tts
 python-docx
 python-pptx
 PyPDF2
+huggingface_hub
+Pillow
