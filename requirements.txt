@@ -3,3 +3,5 @@ openai
 aiohttp
 asyncpg
 edge-tts
+python-docx
+python-pptx
