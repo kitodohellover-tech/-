@@ -267,29 +267,26 @@ async def chat(msg: types.Message):
         answer = response.choices[0].message.content
         await save_message(user_id, "assistant", answer)
 
-        # --- ОТПРАВКА ---
+               # --- ОТПРАВКА: гибрид (текст + голос) ---
+        # 1. Сначала отправляем текст (с разбивкой, если длинный)
+        parts = split_message(answer)
+        if len(parts) == 1:
+            await msg.answer(parts[0])
+        else:
+            for i, part in enumerate(parts, 1):
+                await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
+
+        # 2. Потом озвучиваем (если режим voice или всегда — на твой выбор)
         if mode == "voice":
             await bot.send_chat_action(msg.chat.id, "record_voice")
             try:
                 voice_file = await text_to_voice(answer)
                 if voice_file:
                     from aiogram.types import FSInputFile
-                    await msg.answer_voice(FSInputFile(voice_file), caption="🎤 Голосовой ответ")
-                else:
-                    raise Exception("Пустой текст для озвучки")
+                    await msg.answer_voice(FSInputFile(voice_file))
             except Exception as e:
                 logging.error(f"TTS error: {e}")
-                # Если не вышло с голосом, отправляем текст
-                parts = split_message(answer)
-                for part in parts:
-                    await msg.answer(part)
-        else:
-            parts = split_message(answer)
-            if len(parts) == 1:
-                await msg.answer(parts[0])
-            else:
-                for i, part in enumerate(parts, 1):
-                    await msg.answer(f"📄 Часть {i}/{len(parts)}\n\n{part}")
+                # Если TTS упал — текст уже отправлен, ничего не делаем
 
     except Exception as e:
         error_text = str(e)
