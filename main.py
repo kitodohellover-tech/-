@@ -42,7 +42,7 @@ HISTORY_LIMIT = 20
 MAX_CONTEXT_CHARS = 15000
 
 
-# --- Разбивка длинных сообщений ---
+# --- Утилиты ---
 def split_message(text: str, limit: int = 4000) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -95,7 +95,6 @@ def detect_extension(text: str) -> str:
 
 
 def parse_json_safe(raw: str):
-    """Безопасно парсит JSON из ответа модели."""
     if not raw:
         return None
     if "```" in raw:
@@ -122,26 +121,31 @@ def parse_json_safe(raw: str):
     return None
 
 
-# --- Pollinations: генерация картинки ---
+# --- Pollinations ---
 async def generate_image(prompt: str) -> BytesIO | None:
-    """Генерирует картинку через Pollinations.ai (бесплатно, без ключей)."""
+    """Генерирует картинку через Pollinations.ai."""
     try:
-        # Очищаем промпт
         clean_prompt = re.sub(r'[^\w\s,\-\.]', '', prompt)[:200]
         encoded = clean_prompt.replace(" ", "%20")
         url = (
             f"https://image.pollinations.ai/prompt/{encoded}"
             f"?width=1024&height=768&nologo=true&model=flux"
         )
+        logging.info(f"[Pollinations] Request: {url[:120]}")
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                logging.info(f"[Pollinations] Status: {resp.status}")
                 if resp.status == 200:
                     data = await resp.read()
+                    logging.info(f"[Pollinations] Size: {len(data)} bytes")
                     if len(data) > 1000:
                         return BytesIO(data)
         return None
+    except asyncio.TimeoutError:
+        logging.error(f"[Pollinations] Timeout for: {prompt[:50]}")
+        return None
     except Exception as e:
-        logging.error(f"Pollinations error: {e}")
+        logging.error(f"[Pollinations] Error: {e}")
         return None
 
 
@@ -184,7 +188,7 @@ async def download_file_bytes(file_id: str) -> BytesIO:
     return BytesIO(file_data.read())
 
 
-# --- Транскрипция ---
+# --- Whisper ---
 async def transcribe_audio(file_id: str, file_ext: str = "ogg") -> str:
     file = await bot.get_file(file_id)
     audio_data = await bot.download_file(file.file_path)
@@ -198,7 +202,7 @@ async def transcribe_audio(file_id: str, file_ext: str = "ogg") -> str:
     return transcription.text
 
 
-# --- Голос ---
+# --- TTS ---
 async def text_to_voice(text: str) -> str:
     clean_text = text[:3000].replace("*", "").replace("`", "").strip()
     if not clean_text:
@@ -504,7 +508,7 @@ async def make_docx(msg: types.Message):
         await status.edit_text(f"❌ Не удалось: {str(e)[:200]}")
 
 
-# --- Генерация .pptx с картинками ---
+# --- Генерация .pptx с параллельными картинками ---
 @dp.message(Command("pptx"))
 async def make_pptx(msg: types.Message):
     user_id = msg.from_user.id
@@ -517,13 +521,13 @@ async def make_pptx(msg: types.Message):
     status = await msg.answer(f"📊 Готовлю презентацию: _{topic}_...")
 
     try:
-        # 1. Просим текст слайдов
-        await status.edit_text(f"📊 Генерирую текст слайдов: _{topic}_...")
+        # 1. Текст слайдов
+        await status.edit_text(f"📊 Генерирую текст слайдов...")
         prompt = (
             f"Сделай презентацию на тему: «{topic}». "
             f"Верни ТОЛЬКО JSON-массив без пояснений. "
-            f'Формат: [{{"title": "Заголовок", "points": ["пункт 1", "пункт 2"], "image_prompt": "английский промпт для картинки"}}, ...] '
-            f"Сделай 8 слайдов. Первый — титульный. "
+            f'Формат: [{{"title": "Заголовок", "points": ["пункт 1", "пункт 2"], "image_prompt": "english prompt for image"}}, ...] '
+            f"Сделай РОВНО 8 слайдов. Первый — титульный. "
             f"В каждом слайде 5-6 пунктов, до 120 символов. "
             f"image_prompt — короткое описание картинки на английском (для Pollinations). "
             f"Только JSON, без markdown."
@@ -532,14 +536,31 @@ async def make_pptx(msg: types.Message):
             model="qwen/qwen3.8-27b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
-            max_tokens=1500,
+            max_tokens=1800,
         )
         raw = response.choices[0].message.content
         slides_data = parse_json_safe(raw)
         if not slides_data:
             raise ValueError("Модель вернула невалидный JSON")
 
-        # 2. Собираем презентацию с картинками
+        total = len(slides_data)
+        logging.info(f"[PPTX] Slides: {total}")
+
+        # 2. Все картинки ПАРАЛЛЕЛЬНО
+        await status.edit_text(f"📊 Генерирую {total} картинок параллельно...")
+        image_prompts = [s.get("image_prompt", s.get("title", "abstract")) for s in slides_data]
+        logging.info(f"[PPTX] Image prompts: {image_prompts[:3]}...")
+        
+        images = await asyncio.gather(
+            *[generate_image(p) for p in image_prompts],
+            return_exceptions=True
+        )
+        
+        success_count = sum(1 for img in images if isinstance(img, BytesIO))
+        logging.info(f"[PPTX] Images generated: {success_count}/{total}")
+
+        # 3. Собираем pptx
+        await status.edit_text(f"📊 Собираю презентацию ({success_count}/{total} картинок)...")
         from pptx import Presentation
         from pptx.util import Inches, Pt
 
@@ -547,44 +568,31 @@ async def make_pptx(msg: types.Message):
         prs.slide_width = Inches(10)
         prs.slide_height = Inches(7.5)
 
-        total = len(slides_data)
         for i, slide_data in enumerate(slides_data):
             title = slide_data.get("title", f"Слайд {i+1}")
             points = slide_data.get("points", [])
-            image_prompt = slide_data.get("image_prompt", title)
+            img_bytes = images[i] if i < len(images) and isinstance(images[i], BytesIO) else None
 
-            await status.edit_text(
-                f"📊 Слайд {i+1}/{total}: _{title[:50]}_\n"
-                f"🖼️ Генерирую картинку..."
-            )
-
-            # Генерируем картинку
-            img_bytes = await generate_image(image_prompt)
-
-            # Создаём слайд
-            blank_layout = prs.slide_layouts[6]  # полностью пустой
+            blank_layout = prs.slide_layouts[6]
             slide = prs.slides.add_slide(blank_layout)
 
-            # Заголовок — сверху
+            # Заголовок
             title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
             title_frame = title_box.text_frame
             title_frame.text = title
             title_frame.paragraphs[0].font.size = Pt(28)
             title_frame.paragraphs[0].font.bold = True
 
-            # Текст — слева
+            # Текст
             text_box = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(5), Inches(5.5))
             text_frame = text_box.text_frame
             text_frame.word_wrap = True
             for j, point in enumerate(points):
-                if j == 0:
-                    p = text_frame.paragraphs[0]
-                else:
-                    p = text_frame.add_paragraph()
+                p = text_frame.paragraphs[0] if j == 0 else text_frame.add_paragraph()
                 p.text = f"• {point}"
                 p.font.size = Pt(14)
 
-            # Картинка — справа
+            # Картинка
             if img_bytes:
                 img_bytes.seek(0)
                 try:
@@ -594,12 +602,11 @@ async def make_pptx(msg: types.Message):
                         width=Inches(4), height=Inches(5.5)
                     )
                 except Exception as e:
-                    logging.error(f"Picture insert error: {e}")
+                    logging.error(f"[PPTX] Picture insert error: {e}")
 
         file_path = "presentation.pptx"
         prs.save(file_path)
 
-        await status.edit_text("📊 Собираю файл...")
         comment = await get_file_comment("презентация PowerPoint", topic, user_id)
         safe_name = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
 
@@ -646,66 +653,66 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, use
             )
 
         elif ext == "pptx":
-            try:
-                slides_data = parse_json_safe(ai_response)
-                if not slides_data:
-                    slides_data = []
-                    for chunk in ai_response.split("---"):
-                        lines = [l.strip() for l in chunk.strip().split("\n") if l.strip()]
-                        if lines:
-                            slides_data.append({
-                                "title": lines[0],
-                                "points": [l.lstrip("- ").strip() for l in lines[1:]],
-                                "image_prompt": lines[0]
-                            })
+            slides_data = parse_json_safe(ai_response)
+            if not slides_data:
+                slides_data = []
+                for chunk in ai_response.split("---"):
+                    lines = [l.strip() for l in chunk.strip().split("\n") if l.strip()]
+                    if lines:
+                        slides_data.append({
+                            "title": lines[0],
+                            "points": [l.lstrip("- ").strip() for l in lines[1:]],
+                            "image_prompt": lines[0]
+                        })
 
-                file_bytes.seek(0)
-                from pptx import Presentation
-                from pptx.util import Inches, Pt
-                prs = Presentation(file_bytes)
+            # Параллельно генерим картинки
+            image_prompts = [s.get("image_prompt", s.get("title", "abstract")) for s in slides_data]
+            images = await asyncio.gather(
+                *[generate_image(p) for p in image_prompts],
+                return_exceptions=True
+            )
 
-                total = len(slides_data)
-                for i, slide_data in enumerate(slides_data):
-                    title = slide_data.get("title", "")
-                    points = slide_data.get("points", [])
-                    image_prompt = slide_data.get("image_prompt", title)
-                    if not title:
-                        continue
+            file_bytes.seek(0)
+            from pptx import Presentation
+            from pptx.util import Inches, Pt
+            prs = Presentation(file_bytes)
 
-                    img_bytes = await generate_image(image_prompt)
+            for i, slide_data in enumerate(slides_data):
+                title = slide_data.get("title", "")
+                points = slide_data.get("points", [])
+                if not title:
+                    continue
+                img_bytes = images[i] if i < len(images) and isinstance(images[i], BytesIO) else None
 
-                    blank_layout = prs.slide_layouts[6]
-                    slide = prs.slides.add_slide(blank_layout)
+                blank_layout = prs.slide_layouts[6]
+                slide = prs.slides.add_slide(blank_layout)
 
-                    title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
-                    title_box.text_frame.text = title
-                    title_box.text_frame.paragraphs[0].font.size = Pt(28)
-                    title_box.text_frame.paragraphs[0].font.bold = True
+                title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
+                title_box.text_frame.text = title
+                title_box.text_frame.paragraphs[0].font.size = Pt(28)
+                title_box.text_frame.paragraphs[0].font.bold = True
 
-                    text_box = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(5), Inches(5.5))
-                    tf = text_box.text_frame
-                    tf.word_wrap = True
-                    for j, point in enumerate(points):
-                        p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
-                        p.text = f"• {point}"
-                        p.font.size = Pt(14)
+                text_box = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(5), Inches(5.5))
+                tf = text_box.text_frame
+                tf.word_wrap = True
+                for j, point in enumerate(points):
+                    p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                    p.text = f"• {point}"
+                    p.font.size = Pt(14)
 
-                    if img_bytes:
-                        img_bytes.seek(0)
-                        try:
-                            slide.shapes.add_picture(img_bytes, Inches(5.5), Inches(1.5), width=Inches(4), height=Inches(5.5))
-                        except Exception as e:
-                            logging.error(f"Picture insert error: {e}")
+                if img_bytes:
+                    img_bytes.seek(0)
+                    try:
+                        slide.shapes.add_picture(img_bytes, Inches(5.5), Inches(1.5), width=Inches(4), height=Inches(5.5))
+                    except Exception as e:
+                        logging.error(f"[PPTX EDIT] Picture error: {e}")
 
-                out_path = "updated.pptx"
-                prs.save(out_path)
-                await msg.answer_document(
-                    FSInputFile(out_path, filename=f"updated_{safe_name}"),
-                    caption=await get_file_comment("обновлённая презентация", file_name, user_id)
-                )
-            except Exception as e:
-                logging.error(f"PPTX edit error: {e}")
-                await msg.answer(f"⚠️ Не смог пересобрать .pptx, вот текст:\n\n{ai_response[:3500]}")
+            out_path = "updated.pptx"
+            prs.save(out_path)
+            await msg.answer_document(
+                FSInputFile(out_path, filename=f"updated_{safe_name}"),
+                caption=await get_file_comment("обновлённая презентация", file_name, user_id)
+            )
 
         elif ext == "pdf":
             await msg.answer(f"📄 PDF не пересобираю, вот текст:\n\n{ai_response[:3500]}")
