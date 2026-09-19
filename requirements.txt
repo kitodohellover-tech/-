@@ -5,3 +5,4 @@ asyncpg
 edge-tts
 python-docx
 python-pptx
+PyPDF2
