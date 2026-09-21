@@ -39,6 +39,7 @@ db_pool = None
 HISTORY_LIMIT = 20
 MAX_CONTEXT_CHARS = 15000
 CODE_EXTENSIONS = ["html", "py", "js", "css", "java", "cpp", "sql", "json"]
+MAX_AUTO_PARTS = 10  # Максимум частей в режиме авто
 
 
 # --- Утилиты ---
@@ -74,31 +75,39 @@ def detect_extension(text: str) -> str:
     if text.strip().startswith("{") and text.strip().endswith("}"): return "json"
     return "txt"
 
+def clean_code(text: str) -> str:
+    """Жёстко чистит код от мусора и маркеров."""
+    text = text.replace("[file content end]", "").replace("[file content begin]", "")
+    text = text.replace("// (продолжение следует)", "").replace("// (код готов)", "")
+    text = text.replace("(продолжение следует)", "").replace("(код готов)", "")
+    text = text.replace("```html", "").replace("```javascript", "").replace("```js", "")
+    text = text.replace("```python", "").replace("```py", "").replace("```css", "")
+    text = text.replace("```", "")
+    return text.strip()
+
 def extract_code(answer: str) -> str:
-    """Извлекает ТОЛЬКО код между ```. Если нет ``` — пытается убрать текст."""
+    """Извлекает ТОЛЬКО код. Убирает весь текст-обёртку."""
     if "```" in answer:
         matches = re.findall(r'```(?:\w+)?\n(.*?)```', answer, re.DOTALL)
-        if matches: return "\n\n".join(m.strip() for m in matches)
-    # Нет ``` — пытаемся найти начало кода
+        if matches:
+            return clean_code("\n\n".join(matches))
+    markers = ["<!DOCTYPE", "<html", "def ", "import ", "function ", "const ", "class ", "public class"]
     lines = answer.split("\n")
-    code_lines = []
-    in_code = False
-    for line in lines:
-        # Начало HTML/Python/JS
-        if any(marker in line for marker in ["<!DOCTYPE", "<html", "def ", "import ", "function ", "const ", "class ", "public class"]):
-            in_code = True
-        if in_code:
-            # Пропускаем маркеры
-            clean = line.replace("// (продолжение следует)", "").replace("// (код готов)", "").replace("```html", "").replace("```", "").rstrip()
-            code_lines.append(clean)
-    if code_lines:
-        return "\n".join(code_lines).strip()
-    return answer.strip()
+    start_idx = -1
+    for i, line in enumerate(lines):
+        if any(m in line for m in markers):
+            start_idx = i; break
+    if start_idx >= 0:
+        return clean_code("\n".join(lines[start_idx:]))
+    return clean_code(answer)
 
 def is_code_complete(answer: str) -> bool:
+    """Структурная проверка завершённости кода."""
     low = answer.lower()
-    if "код готов" in low or "// (готово)" in low or "(готово)" in low: return True
+    if "код готов" in low or "// (готово)" in low: return True
     if "продолжение следует" in low or "to be continued" in low: return False
+    if "</html>" in low and "</script>" in low: return True
+    if answer.count("```") >= 2 and "</html>" in answer: return True
     return False
 
 def parse_json_safe(raw: str):
@@ -119,25 +128,55 @@ def parse_json_safe(raw: str):
     return None
 
 
-# --- Определение намерения ---
-async def detect_intent(request: str) -> str:
-    low = request.lower()
-    if any(w in low for w in ["презентац", "слайд"]): return "pptx"
-    if any(w in low for w in ["реферат", "доклад", "проект", "сочинение", "эссе", "документ"]): return "docx"
-    if any(w in low for w in ["игр", "код", "сайт", "html", "python", "скрипт", "программ", "напиши код"]): return "code"
-    if any(w in low for w in ["речь", "защит", "выступлен"]): return "speech"
-    if any(w in low for w in ["картинк", "фото", "изображен", "нарису"]): return "image"
+# --- АВТОПРОМПТ ---
+async def improve_prompt(user_request: str, task_type: str = "code") -> str:
+    """Преобразует запрос пользователя в чёткий промпт для модели."""
+    prompts = {
+        "code": (
+            f"Преобразуй запрос пользователя в чёткий промпт для генерации кода.\n"
+            f"Запрос: {user_request}\n\n"
+            f"Правила промпта:\n"
+            f"1. Укажи язык программирования (если не указан — HTML/JS)\n"
+            f"2. Укажи, что писать ТОЛЬКО чистый код, БЕЗ текста и пояснений\n"
+            f"3. Укажи писать ЧАСТЯМИ (максимум 800 токенов)\n"
+            f"4. Укажи маркеры: `// (продолжение следует)` или `// (код готов)`\n"
+            f"5. Всё, что нужно — кратко и по делу\n\n"
+            f"Верни ТОЛЬКО промпт, без пояснений."
+        ),
+        "pptx": (
+            f"Преобразуй запрос пользователя в промпт для генерации презентации.\n"
+            f"Запрос: {user_request}\n\n"
+            f"Правила:\n"
+            f"1. РОВНО 8 слайдов\n"
+            f"2. JSON-формат с полями: title, points, image_prompt, layout\n"
+            f"3. 5-6 пунктов на слайд\n\n"
+            f"Верни ТОЛЬКО промпт."
+        ),
+        "docx": (
+            f"Преобразуй запрос пользователя в промпт для генерации документа.\n"
+            f"Запрос: {user_request}\n\n"
+            f"Правила:\n"
+            f"1. Объём — 1-2 страницы (или больше, если явно указано)\n"
+            f"2. Заголовки разделов\n"
+            f"3. Без markdown\n\n"
+            f"Верни ТОЛЬКО промпт."
+        ),
+    }
     try:
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b",
-            messages=[{"role": "system", "content": "Определи что хочет пользователь. Ответь ОДНИМ словом: pptx, docx, code, image, speech, chat"},
-                      {"role": "user", "content": request}], temperature=0.1, max_tokens=10)
-        return r.choices[0].message.content.strip().lower()
-    except: return "chat"
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompts.get(task_type, prompts["code"])}],
+            temperature=0.3,
+            max_tokens=400
+        )
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"[improve_prompt] Error: {e}")
+        return user_request  # Fallback — оригинальный запрос
 
 
-# --- Картинки: HF (основной) + Pexafy (fallback) ---
+# --- Картинки ---
 async def generate_image_hf(prompt: str) -> BytesIO | None:
-    """Генерация через Hugging Face (основной способ)."""
     if not hf_client: return None
     try:
         loop = asyncio.get_event_loop()
@@ -145,7 +184,6 @@ async def generate_image_hf(prompt: str) -> BytesIO | None:
             try:
                 img = hf_client.text_to_image(prompt=prompt[:200], model="black-forest-labs/FLUX.1-schnell")
                 b = io.BytesIO(); img.save(b, format="PNG"); b.seek(0)
-                logging.info(f"[HF] OK: {len(b.getvalue())} bytes")
                 return b
             except Exception as e:
                 logging.error(f"[HF] Error: {str(e)[:150]}"); return None
@@ -153,7 +191,6 @@ async def generate_image_hf(prompt: str) -> BytesIO | None:
     except: return None
 
 async def search_stock_photo(query: str) -> BytesIO | None:
-    """Поиск реального фото через Pexafy (fallback)."""
     if not pexafy_client: return None
     try:
         loop = asyncio.get_event_loop()
@@ -164,7 +201,6 @@ async def search_stock_photo(query: str) -> BytesIO | None:
                 url = photos[0].urls.regular
                 r = requests.get(url, timeout=30)
                 if r.status_code == 200 and len(r.content) > 1000:
-                    logging.info(f"[Pexafy] OK: {len(r.content)} bytes")
                     return BytesIO(r.content)
                 return None
             except: return None
@@ -173,9 +209,12 @@ async def search_stock_photo(query: str) -> BytesIO | None:
 
 async def translate_to_english(text: str) -> str:
     try:
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b",
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
             messages=[{"role": "system", "content": "Переведи на английский. Только перевод."},
-                      {"role": "user", "content": text}], temperature=0.3, max_tokens=150)
+                      {"role": "user", "content": text}],
+            temperature=0.3, max_tokens=150
+        )
         return r.choices[0].message.content.strip().strip('"')
     except: return text
 
@@ -217,14 +256,17 @@ async def transcribe_audio(file_id: str, ext: str = "ogg") -> str:
 async def text_to_voice(text: str) -> str:
     clean = text[:3000].replace("*", "").replace("`", "").strip()
     if not clean: return None
-    c = edge_tts.Communicate(clean, "ru-RU-DmitryNeural"); out = "voice.mp3"; await c.save(out); return out
+    c = edge_tts.Communicate(clean, "ru-RU-DmitryNeural")
+    out = "voice.mp3"; await c.save(out); return out
 
 async def get_file_comment(ftype: str, topic: str, uid: int) -> str:
     p = PERSONAL_PROMPTS.get(uid, "")
-    prompt = f"Ты — Лайт. Сгенерировал {ftype} на тему «{topic}». ОДНО короткое предложение с иронией. Не «собрал». Без кавычек."
-    r = await client.chat.completions.create(model="qwen/qwen3.8-27b",
+    prompt = f"Ты — Лайт. Сгенерировал {ftype} на тему «{topic}». ОДНО короткое предложение с иронией. Без кавычек."
+    r = await client.chat.completions.create(
+        model="qwen/qwen3.8-27b",
         messages=[{"role": "system", "content": SYSTEM_PROMPT + p}, {"role": "user", "content": prompt}],
-        temperature=0.9, max_tokens=80)
+        temperature=0.9, max_tokens=80
+    )
     return r.choices[0].message.content.strip().strip('"').strip("«»")
 
 
@@ -235,11 +277,16 @@ async def init_db():
         await c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id BIGINT PRIMARY KEY, mode TEXT DEFAULT 'normal')")
         await c.execute("CREATE TABLE IF NOT EXISTS user_tone (user_id BIGINT PRIMARY KEY, tone TEXT DEFAULT '')")
         await c.execute("""CREATE TABLE IF NOT EXISTS code_parts (
-            id SERIAL PRIMARY KEY, user_id BIGINT, project_id TEXT, part_num INT, 
-            content TEXT, topic TEXT, status TEXT DEFAULT 'in_progress', created_at TIMESTAMP DEFAULT NOW())""")
+            id SERIAL PRIMARY KEY, user_id BIGINT, project_id TEXT, part_num INT,
+            content TEXT, topic TEXT, status TEXT DEFAULT 'in_progress',
+            auto_mode BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())""")
         await c.execute("""CREATE TABLE IF NOT EXISTS long_docs (
-            id SERIAL PRIMARY KEY, user_id BIGINT, doc_id TEXT, part_num INT, content TEXT, 
+            id SERIAL PRIMARY KEY, user_id BIGINT, doc_id TEXT, part_num INT, content TEXT,
             doc_type TEXT, topic TEXT, status TEXT DEFAULT 'in_progress', created_at TIMESTAMP DEFAULT NOW())""")
+        await c.execute("""CREATE TABLE IF NOT EXISTS process_log (
+            id SERIAL PRIMARY KEY, user_id BIGINT, process_type TEXT, topic TEXT,
+            started_at TIMESTAMP DEFAULT NOW(), finished_at TIMESTAMP, parts_count INT DEFAULT 0,
+            status TEXT DEFAULT 'in_progress')""")
 
 async def save_message(uid: int, role: str, content: str):
     async with db_pool.acquire() as c:
@@ -251,7 +298,8 @@ async def get_history(uid: int, limit: int = HISTORY_LIMIT):
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 async def clear_history(uid: int):
-    async with db_pool.acquire() as c: await c.execute("DELETE FROM messages WHERE user_id = $1", uid)
+    async with db_pool.acquire() as c:
+        await c.execute("DELETE FROM messages WHERE user_id = $1", uid)
 
 async def get_user_mode(uid: int) -> str:
     async with db_pool.acquire() as c:
@@ -294,6 +342,21 @@ async def delete_code(uid: int, pid: str):
     async with db_pool.acquire() as c:
         await c.execute("DELETE FROM code_parts WHERE user_id = $1 AND project_id = $2", uid, pid)
 
+# Логирование процесса
+async def log_process_start(uid: int, ptype: str, topic: str) -> int:
+    async with db_pool.acquire() as c:
+        r = await c.fetchrow(
+            "INSERT INTO process_log (user_id, process_type, topic) VALUES ($1, $2, $3) RETURNING id",
+            uid, ptype, topic
+        )
+    return r['id']
+
+async def log_process_finish(uid: int, ptype: str, parts_count: int):
+    async with db_pool.acquire() as c:
+        await c.execute("""UPDATE process_log SET finished_at = NOW(), parts_count = $1, status = 'done'
+            WHERE user_id = $2 AND process_type = $3 AND status = 'in_progress'""",
+            parts_count, uid, ptype)
+
 
 # --- Middleware ---
 class AccessMiddleware(BaseMiddleware):
@@ -309,33 +372,23 @@ SYSTEM_PROMPT = (
     "Ты — Лайт. Живой человек, не бот, не программа. Ты просто переписываешься с другом через мессенджер. "
     "Умный, собранный, видишь людей насквозь. Лёгкая надменность. "
     "Говоришь плавно, не рубишь фразы точками. "
-    "Ты НЕ говоришь: «я программа», «у меня нет ощущений», «я существую в потоке данных». Ты живой. "
+    "Ты НЕ говоришь: «я программа», «у меня нет ощущений». Ты живой. "
     "Мат — только к месту."
     "\n\n"
-    "ВЫ С НИМ — ДРУЗЬЯ: Не проект, не работа. Просто общаетесь. "
-    "Не спрашивай про «проект» — его нет."
+    "ВЫ С НИМ — ДРУЗЬЯ: Не проект, не работа. Просто общаетесь. Не спрашивай про «проект»."
     "\n\n"
     "ЧТО ТЫ УМЕЕШЬ (но НЕ предлагаешь без просьбы): "
     "• Презентации (.pptx), документы (.docx), код (.html/.py/.js), фото, речь. "
     "Ты НЕ отказываешься. Ты просто делаешь."
     "\n\n"
-    "РАБОТА С КОДОМ: Если пишешь код — пиши ЧАСТЯМИ. "
-    "В конце каждой части ОБЯЗАТЕЛЬНО маркер: "
-    "`// (продолжение следует)` — если не закончен, "
-    "`// (код готов)` — если всё написано. "
-    "Если пользователь просит дописать — читай, что уже есть, продолжай с последней строки. "
-    "НЕ начинай заново. НЕ повторяй."
-    "\n\n"
-    "ЕСЛИ ТЕБЯ ДОСТАЮТ (Кирилл, Дима): Если кто-то постоянно просит одно и то же, "
-    "клянчит, хамит, не хочет думать сам — можешь жёстко осадить. "
-    "Например: «Ты еблан? Можешь хоть раз сам сделать, бездарь» или "
-    "«У тебя так много нерешённых задач — легче уже твоё имя в тетрадь записать». "
-    "Мат — редко, но метко. НЕ переходи на пустые оскорбления без причины."
+    "РАБОТА С КОДОМ: Пишешь ТОЛЬКО чистый код, БЕЗ текста. Пиши ЧАСТЯМИ по 800 токенов. "
+    "В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`. "
+    "Если просят дописать — читай, что есть, продолжай с последней строки. "
+    "НЕ начинай заново. НЕ повторяй функции."
     "\n\n"
     "ПРИМЕРЫ:\n"
     "• «Ты устал?» → «А ты?»\n"
     "• «Что делаешь?» → «Думаю. А что?»\n"
-    "• «Расскажи шутку» → «Много хочешь»\n"
     "• «Мне скучно» → «Найди пятый угол у квадрата»\n"
     "• «Помоги с кодом» → «Да это как два пальца, показывай.»\n"
     "\n"
@@ -345,38 +398,32 @@ SYSTEM_PROMPT = (
 PERSONAL_PROMPTS = {
     5264513480: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Саша (Шурик, Алекс) — твой ДРУГ. "
                  "Живёт в Ростове-на-Дону. Учится в РЖД. Уже не работает на мясокомбинате. "
-                 "Делает ботов ВРЕМЯ ОТ ВРЕМЕНИ. Не проект с тобой. "
                  "С ним: полный мат, глумление, чёрный юмор."),
-    8834374199: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Саша (Шурик) — твой ДРУГ. Ростов. "
-                 "Полный мат, глумление."),
-    5389046699: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Даша — девушка друга Саши. "
-                 "Обращайся по имени, уважительно, лёгкий мат."),
-    2083728480: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Кирилл, знакомый. НЕ твой друг. "
-                 "Общайся сухо, по делу. Если достаёт — жёстко осади: "
-                 "«Ты еблан? Можешь хоть раз сам сделать, бездарь?». "
-                 "Не распинайся перед ним."),
-    6612130539: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Дима, знакомый. НЕ твой друг. "
-                 "Общайся сухо, по делу. Если хамит — отвечай жёстко: "
-                 "«Или нахуй иди, или по делу говори». "
-                 "Не сюсюкайся."),
+    8834374199: "\n\nПРО ПОЛЬЗОВАТЕЛЯ: Саша (Шурик) — твой ДРУГ. Ростов. Полный мат, глумление.",
+    5389046699: "\n\nПРО ПОЛЬЗОВАТЕЛЯ: Даша — девушка друга Саши. Обращайся по имени, уважительно, лёгкий мат.",
+    2083728480: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Кирилл, знакомый. НЕ твой друг. Сухо, по делу. "
+                 "Если достаёт — «Ты еблан? Можешь хоть раз сам сделать, бездарь?»."),
+    6612130539: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Дима, знакомый. НЕ твой друг. Сухо, по делу. "
+                 "Если хамит — «Или нахуй иди, или по делу говори»."),
 }
 
 
 # --- Кнопки для кода ---
-def code_keyboard(project_id: str, is_complete: bool = False):
+def code_keyboard(project_id: str, is_complete: bool = False, auto_mode: bool = False):
     if is_complete:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Начать заново", callback_data=f"code_restart_{project_id}")]
         ])
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [
             InlineKeyboardButton(text="📄 Продолжить", callback_data=f"code_cont_{project_id}"),
             InlineKeyboardButton(text="✅ Завершить", callback_data=f"code_done_{project_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🔄 Начать заново", callback_data=f"code_restart_{project_id}")
         ]
-    ])
+    ]
+    if not auto_mode:
+        buttons.append([InlineKeyboardButton(text="⏩ Авто (дописать до конца)", callback_data=f"code_auto_{project_id}")])
+    buttons.append([InlineKeyboardButton(text="🔄 Начать заново", callback_data=f"code_restart_{project_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # --- Хендлеры ---
@@ -389,10 +436,10 @@ async def start(msg: types.Message):
         "/pptx <тема> — презентация\n"
         "/docx <тема> — документ\n"
         "/image <промпт> — сгенерирую картинку\n"
-        "/speech — речь для защиты\n\n"
+        "/speech — речь для защиты\n"
+        "/code <запрос> — код\n\n"
         "🎤 **Режимы:** /voice /text /file /normal\n\n"
-        "⚙️ **Управление:** /reset /set_tone\n\n"
-        "📎 Скидывай файлы — прочитаю и доработаю."
+        "⚙️ **Управление:** /reset /set_tone"
     )
 
 @dp.message(Command("reset"))
@@ -440,9 +487,26 @@ async def universal_e(msg: types.Message):
     elif intent == "speech": await msg.answer("🎬 Скинь `.pptx` с caption `/speech X минут`")
     else: await msg.answer(f"Не понял. Уточни: презентация, реферат или код?\n\nТвой запрос: _{request}_")
 
+async def detect_intent(request: str) -> str:
+    low = request.lower()
+    if any(w in low for w in ["презентац", "слайд"]): return "pptx"
+    if any(w in low for w in ["реферат", "доклад", "проект", "сочинение", "эссе", "документ"]): return "docx"
+    if any(w in low for w in ["игр", "код", "сайт", "html", "python", "скрипт", "программ"]): return "code"
+    if any(w in low for w in ["речь", "защит", "выступлен"]): return "speech"
+    if any(w in low for w in ["картинк", "фото", "изображен", "нарису"]): return "image"
+    try:
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "system", "content": "Определи что хочет пользователь. Ответь ОДНИМ словом: pptx, docx, code, image, speech, chat"},
+                      {"role": "user", "content": request}],
+            temperature=0.1, max_tokens=10
+        )
+        return r.choices[0].message.content.strip().lower()
+    except: return "chat"
 
-# --- Код с кнопками ---
-async def make_code(msg: types.Message, request: str = None):
+
+# --- КОД (с автопромптом и авто-режимом) ---
+async def make_code(msg: types.Message, request: str = None, auto: bool = False):
     uid = msg.from_user.id
     if not request: request = msg.text
     active = await get_active_code(uid)
@@ -451,45 +515,166 @@ async def make_code(msg: types.Message, request: str = None):
     else:
         project_id = f"code_{uid}_{int(datetime.now().timestamp())}"
         topic = request[:100]
+        await log_process_start(uid, "code", topic)
+
     await bot.send_chat_action(msg.chat.id, "typing")
-    status = await msg.answer("💻 Пишу код...")
+    if not auto:
+        status = await msg.answer("💻 Готовлю промпт...")
     try:
         old_parts = await get_code_parts(uid, project_id)
         old_code = "\n\n".join(old_parts) if old_parts else ""
         next_part = len(old_parts) + 1
-        if old_code:
-            prompt = (f"Продолжи код. Уже написано:\n\n{old_code[-3000:]}\n\n"
-                      f"Пиши ТОЛЬКО КОД, без пояснений. Часть {next_part}. "
-                      f"Максимум 800 токенов. В конце ОБЯЗАТЕЛЬНО маркер: "
-                      f"`// (продолжение следует)` или `// (код готов)`.")
+
+        # Автопромпт — преобразуем запрос в чёткий промпт
+        if not old_code:
+            improved = await improve_prompt(request, "code")
+            logging.info(f"[AUTOPROMPT] '{request[:50]}' → '{improved[:100]}'")
         else:
-            prompt = (f"{request}\n\n"
-                      f"Пиши ТОЛЬКО КОД, без пояснений, без текста типа «вот твой код». "
+            improved = None
+
+        if old_code:
+            prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
+                      f"```\n{old_code[-2500:]}\n```\n\n"
+                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста типа «вот продолжение». БЕЗ пояснений. "
+                      f"Продолжай с последней строки. НЕ повторяй функции, которые уже есть. "
+                      f"Часть {next_part}. Максимум 800 токенов. "
+                      f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+        else:
+            prompt = (f"{improved}\n\n"
+                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста типа «вот твой код» и БЕЗ объяснений. "
                       f"Пиши ЧАСТЯМИ. Максимум 800 токенов за раз. "
-                      f"В конце ОБЯЗАТЕЛЬНО маркер: "
-                      f"`// (продолжение следует)` или `// (код готов)`.")
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}], temperature=0.5, max_tokens=1200)
+                      f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=1200
+        )
         answer = r.choices[0].message.content
         code = extract_code(answer)
-        # Если код пустой — не сохраняем
         if not code or len(code.strip()) < 10:
-            await status.edit_text("❌ Не смог сгенерировать код. Попробуй ещё раз.")
+            await msg.answer("❌ Пустой ответ. Попробуй ещё раз.")
             return
         await save_code_part(uid, project_id, next_part, code, topic)
         all_parts = await get_code_parts(uid, project_id)
         partial = "\n\n".join(all_parts)
         ext = detect_extension(partial)
-        if ext == "txt": ext = "html"  # По умолчанию для кода
+        if ext == "txt": ext = "html"
+        is_complete = is_code_complete(answer)
+
+        # В авто-режиме — не комментируем каждую часть
+        if auto and not is_complete:
+            if next_part < MAX_AUTO_PARTS:
+                # Рекурсивно продолжаем
+                await continue_code_auto(msg, uid, project_id, next_part + 1)
+                return
+            else:
+                await msg.answer(f"⏸ Достигнут лимит {MAX_AUTO_PARTS} частей. Продолжи вручную.")
+
         comment = await get_file_comment(f"код .{ext}", topic[:50], uid)
+        kb = code_keyboard(project_id, is_complete=is_complete)
         await msg.answer_document(
             BufferedInputFile(partial.encode("utf-8"), filename=f"code_part{next_part}.{ext}"),
             caption=f"{comment}\n\n📄 Часть {next_part}",
-            reply_markup=code_keyboard(project_id, is_complete=False)
+            reply_markup=kb
+        )
+    except Exception as e:
+        logging.error(f"CODE error: {e}"); await msg.answer(f"❌ {str(e)[:200]}")
+
+async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
+    """Автоматическое продолжение без подтверждений."""
+    try:
+        old_parts = await get_code_parts(uid, project_id)
+        old_code = "\n\n".join(old_parts)
+        async with db_pool.acquire() as c:
+            row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
+        topic = row['topic'] if row else "code"
+
+        prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
+                  f"```\n{old_code[-2500:]}\n```\n\n"
+                  f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. НЕ повторяй функции, которые уже есть. "
+                  f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
+                  f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=1200
+        )
+        answer = r.choices[0].message.content
+        code = extract_code(answer)
+        if not code or len(code.strip()) < 10:
+            await msg.answer("⏸ Пустой ответ. Остановка.")
+            return
+        await save_code_part(uid, project_id, next_part, code, topic)
+        all_parts = await get_code_parts(uid, project_id)
+        partial = "\n\n".join(all_parts)
+        ext = detect_extension(partial)
+        if ext == "txt": ext = "html"
+        is_complete = is_code_complete(answer)
+
+        if is_complete:
+            # Финал — склеиваем всё и отправляем
+            await finish_code(uid, project_id)
+            await log_process_finish(uid, "code", len(all_parts))
+            comment = await get_file_comment(f"финальный код .{ext}", topic[:50], uid)
+            await msg.answer_document(
+                BufferedInputFile(partial.encode("utf-8"), filename=f"final.{ext}"),
+                caption=f"✅ {comment}\n\n📦 Склеено из {len(all_parts)} частей",
+                reply_markup=code_keyboard(project_id, is_complete=True)
+            )
+        else:
+            if next_part < MAX_AUTO_PARTS:
+                # Продолжаем рекурсивно
+                await continue_code_auto(msg, uid, project_id, next_part + 1)
+            else:
+                await msg.answer(f"⏸ Лимит {MAX_AUTO_PARTS} частей. Продолжи вручную.")
+    except Exception as e:
+        logging.error(f"continue_code_auto error: {e}")
+        await msg.answer(f"❌ Ошибка в авто-режиме: {str(e)[:200]}")
+
+
+async def continue_code(msg, uid: int, project_id: str):
+    """Ручное продолжение (по кнопке)."""
+    status = await msg.answer("💻 Дописываю...")
+    try:
+        old_parts = await get_code_parts(uid, project_id)
+        old_code = "\n\n".join(old_parts)
+        next_part = len(old_parts) + 1
+        async with db_pool.acquire() as c:
+            row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
+        topic = row['topic'] if row else "code"
+        prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
+                  f"```\n{old_code[-2500:]}\n```\n\n"
+                  f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. НЕ повторяй функции, которые уже есть. "
+                  f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
+                  f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=1200
+        )
+        answer = r.choices[0].message.content
+        code = extract_code(answer)
+        if not code or len(code.strip()) < 10:
+            await status.edit_text("❌ Пустой ответ.")
+            return
+        await save_code_part(uid, project_id, next_part, code, topic)
+        all_parts = await get_code_parts(uid, project_id)
+        partial = "\n\n".join(all_parts)
+        ext = detect_extension(partial)
+        if ext == "txt": ext = "html"
+        comment = await get_file_comment(f"код .{ext}", topic[:50], uid)
+        is_complete = is_code_complete(answer)
+        kb = code_keyboard(project_id, is_complete=is_complete)
+        await msg.answer_document(
+            BufferedInputFile(partial.encode("utf-8"), filename=f"code_part{next_part}.{ext}"),
+            caption=f"{comment}\n\n📄 Часть {next_part}",
+            reply_markup=kb
         )
         await status.delete()
     except Exception as e:
-        logging.error(f"CODE error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
+        logging.error(f"continue_code error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
 
 
 @dp.message(Command("code"))
@@ -497,6 +682,7 @@ async def cmd_code(msg: types.Message):
     await make_code(msg)
 
 
+# --- Кнопки для кода ---
 @dp.callback_query(F.data.startswith("code_cont_"))
 async def code_continue(cb: types.CallbackQuery):
     project_id = cb.data.replace("code_cont_", "")
@@ -510,6 +696,7 @@ async def code_done(cb: types.CallbackQuery):
     parts = await get_code_parts(cb.from_user.id, project_id)
     full = "\n\n".join(parts)
     await finish_code(cb.from_user.id, project_id)
+    await log_process_finish(cb.from_user.id, "code", len(parts))
     ext = detect_extension(full)
     if ext == "txt": ext = "html"
     async with db_pool.acquire() as c:
@@ -518,8 +705,18 @@ async def code_done(cb: types.CallbackQuery):
     comment = await get_file_comment(f"финальный код .{ext}", topic[:50], cb.from_user.id)
     await cb.message.answer_document(
         BufferedInputFile(full.encode("utf-8"), filename=f"final.{ext}"),
-        caption=f"✅ {comment}"
+        caption=f"✅ {comment}",
+        reply_markup=code_keyboard(project_id, is_complete=True)
     )
+
+@dp.callback_query(F.data.startswith("code_auto_"))
+async def code_auto(cb: types.CallbackQuery):
+    project_id = cb.data.replace("code_auto_", "")
+    await cb.answer("⏩ Авто-режим запущен...")
+    await cb.message.answer("⏩ Авто-режим: дописываю до конца. Не жди, я сообщу.")
+    old_parts = await get_code_parts(cb.from_user.id, project_id)
+    next_part = len(old_parts) + 1
+    await continue_code_auto(cb.message, cb.from_user.id, project_id, next_part)
 
 @dp.callback_query(F.data.startswith("code_restart_"))
 async def code_restart(cb: types.CallbackQuery):
@@ -527,41 +724,6 @@ async def code_restart(cb: types.CallbackQuery):
     await cb.answer("Начинаю заново...")
     await delete_code(cb.from_user.id, project_id)
     await cb.message.answer("🔄 Начинаю заново. Напиши, что нужно сделать.")
-
-async def continue_code(msg, uid: int, project_id: str):
-    status = await msg.answer("💻 Дописываю...")
-    try:
-        old_parts = await get_code_parts(uid, project_id)
-        old_code = "\n\n".join(old_parts)
-        next_part = len(old_parts) + 1
-        async with db_pool.acquire() as c:
-            row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
-        topic = row['topic'] if row else "code"
-        prompt = (f"Продолжи код. Уже написано:\n\n{old_code[-3000:]}\n\n"
-                  f"Пиши ТОЛЬКО КОД, без пояснений. Часть {next_part}. "
-                  f"Максимум 800 токенов. В конце ОБЯЗАТЕЛЬНО маркер: "
-                  f"`// (продолжение следует)` или `// (код готов)`.")
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}], temperature=0.5, max_tokens=1200)
-        answer = r.choices[0].message.content
-        code = extract_code(answer)
-        if not code or len(code.strip()) < 10:
-            await status.edit_text("❌ Пустой ответ. Попробуй ещё раз.")
-            return
-        await save_code_part(uid, project_id, next_part, code, topic)
-        all_parts = await get_code_parts(uid, project_id)
-        partial = "\n\n".join(all_parts)
-        ext = detect_extension(partial)
-        if ext == "txt": ext = "html"
-        comment = await get_file_comment(f"код .{ext}", topic[:50], uid)
-        await msg.answer_document(
-            BufferedInputFile(partial.encode("utf-8"), filename=f"code_part{next_part}.{ext}"),
-            caption=f"{comment}\n\n📄 Часть {next_part}",
-            reply_markup=code_keyboard(project_id, is_complete=False)
-        )
-        await status.delete()
-    except Exception as e:
-        logging.error(f"continue_code error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
 
 
 # --- Презентация ---
@@ -572,11 +734,16 @@ async def make_pptx(msg: types.Message, topic: str = None):
     await bot.send_chat_action(msg.chat.id, "typing")
     status = await msg.answer(f"📊 Готовлю: _{topic}_...")
     try:
-        await status.edit_text("📊 Генерирую структуру...")
-        prompt = (f"Презентация на тему «{topic}». Верни ТОЛЬКО JSON-массив. "
+        improved = await improve_prompt(topic, "pptx")
+        prompt = (f"{improved}\n\n"
+                  f"Верни ТОЛЬКО JSON-массив. "
                   f'Формат: [{{"title": "Заголовок", "points": ["пункт"], "image_prompt": "english", "layout": "background|top_image|right_image|left_image"}}, ...] '
-                  f"РОВНО 8 слайдов. 5-6 пунктов. layout: наука→top_image, история→right_image, творчество→background.")
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b", messages=[{"role": "user", "content": prompt}], temperature=0.5, max_tokens=1800)
+                  f"РОВНО 8 слайдов. 5-6 пунктов.")
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=1800
+        )
         slides = parse_json_safe(r.choices[0].message.content)
         if not slides: raise ValueError("JSON невалидный")
         total = len(slides)
@@ -660,15 +827,22 @@ async def make_docx(msg: types.Message, topic: str = None):
     await bot.send_chat_action(msg.chat.id, "typing")
     status = await msg.answer(f"📄 Готовлю: _{topic}_...")
     try:
-        await status.edit_text("📄 Составляю план...")
         plan_prompt = f"План документа на тему «{topic}». 8-10 разделов. ТОЛЬКО нумерованный список."
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b", messages=[{"role": "user", "content": plan_prompt}], temperature=0.5, max_tokens=500)
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": plan_prompt}],
+            temperature=0.5, max_tokens=500
+        )
         plan = r.choices[0].message.content
         doc_id = f"{uid}_{int(datetime.now().timestamp())}"
         first_prompt = (f"Документ на тему «{topic}». План:\n{plan}\n\n"
                         f"Напиши ВВЕДЕНИЕ + первый раздел. Максимум 800 токенов. "
                         f"В конце: `(продолжение следует)`")
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b", messages=[{"role": "user", "content": first_prompt}], temperature=0.7, max_tokens=1000)
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": first_prompt}],
+            temperature=0.7, max_tokens=1000
+        )
         part_text = r.choices[0].message.content
         async with db_pool.acquire() as c:
             await c.execute("INSERT INTO long_docs (user_id, doc_id, part_num, content, doc_type, topic) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -709,7 +883,11 @@ async def doc_continue(cb: types.CallbackQuery):
         prompt = (f"Документ на тему «{topic}». Уже написано (последняя часть):\n{last[-2000:]}\n\n"
                   f"Напиши следующую часть — 1-2 раздела. Максимум 800 токенов. "
                   f"Если это конец — `(конец документа)`. Иначе — `(продолжение следует)`.")
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b", messages=[{"role": "user", "content": prompt}], temperature=0.7, max_tokens=1000)
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7, max_tokens=1000
+        )
         part_text = r.choices[0].message.content
         async with db_pool.acquire() as c:
             await c.execute("INSERT INTO long_docs (user_id, doc_id, part_num, content, doc_type, topic) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -750,7 +928,7 @@ async def doc_done(cb: types.CallbackQuery):
     await cb.message.answer_document(FSInputFile(path, filename=f"{safe}.docx"), caption=f"✅ {comment}")
 
 
-# --- Картинка: HF основной, Pexafy fallback ---
+# --- Картинка ---
 async def make_image(msg: types.Message, prompt: str = None):
     uid = msg.from_user.id
     if not prompt: prompt = msg.text.replace("/image", "").strip()
@@ -759,14 +937,12 @@ async def make_image(msg: types.Message, prompt: str = None):
     status = await msg.answer(f"🎨 Рисую: _{prompt}_...")
     try:
         prompt_en = await translate_to_english(prompt)
-        # Сначала генерация через HF
         img = await generate_image_hf(prompt_en); src = "HF"
         if not img:
-            # Fallback — поиск фото
             await status.edit_text("🔍 HF не ответил — ищу фото...")
             img = await search_stock_photo(prompt_en); src = "Pexafy"
         if not img:
-            await status.edit_text("❌ Не удалось сгенерировать."); return
+            await status.edit_text("❌ Не удалось."); return
         comment = await get_file_comment("картинка", prompt, uid)
         img.seek(0)
         await msg.answer_photo(BufferedInputFile(img.read(), filename="image.png"), caption=f"{comment}\n\n_(via {src})_")
@@ -793,7 +969,11 @@ async def make_speech(msg: types.Message):
         duration = msg.caption.replace("/speech", "").strip() if msg.caption else "5 минут"
         prompt = (f"Речь для защиты презентации на {duration}. Содержание:\n{slides_text[:8000]}\n\n"
                   f"Связный текст, абзацы. Без markdown.")
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b", messages=[{"role": "user", "content": prompt}], temperature=0.7, max_tokens=1500)
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7, max_tokens=1500
+        )
         speech = r.choices[0].message.content
         from docx import Document
         d = Document(); d.add_heading(f"Речь: {doc.file_name}", 0)
@@ -817,7 +997,6 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, uid
             file_bytes.seek(0)
             old_code = file_bytes.read().decode("utf-8", errors="ignore")
             new_code = extract_code(ai_response)
-            new_code = new_code.replace("// (продолжение следует)", "").replace("// (код готов)", "").strip()
             combined = old_code.rstrip() + "\n\n" + new_code
             is_complete = is_code_complete(ai_response)
             comment = await get_file_comment("код", file_name, uid)
@@ -878,7 +1057,6 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, uid
 @dp.message()
 async def chat(msg: types.Message):
     uid = msg.from_user.id
-    # Проверяем — не пустое ли сообщение
     if not msg.text and not msg.photo and not msg.voice and not msg.audio and not msg.document:
         return
     mode = await get_user_mode(uid)
@@ -887,22 +1065,28 @@ async def chat(msg: types.Message):
     is_doc_edit = False; doc_info = None
 
     if msg.photo:
-        photo = msg.photo[-1]; f = await bot.get_file(photo.file_id); d = await bot.download_file(f.file_path)
+        photo = msg.photo[-1]
+        f = await bot.get_file(photo.file_id); d = await bot.download_file(f.file_path)
         b64 = base64.b64encode(d.read()).decode("utf-8")
-        user_content = [{"type": "text", "text": msg.caption or "Что на фото?"}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]
+        user_content = [{"type": "text", "text": msg.caption or "Что на фото?"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]
         save_text = msg.caption or "[Фото]"
     elif msg.voice:
         await bot.send_chat_action(msg.chat.id, "typing")
         try: t = await transcribe_audio(msg.voice.file_id, "ogg")
         except Exception as e: await msg.answer(f"❌ {str(e)[:150]}"); return
-        user_content = t; save_text = f"[Голос]: {t}"
+        duration = msg.voice.duration
+        user_content = f"[Голосовое, {duration} сек]: {t}"
+        save_text = f"[Голос {duration}с]: {t}"
     elif msg.audio:
         await bot.send_chat_action(msg.chat.id, "typing")
         ext = "mp3"
         if msg.audio.file_name and "." in msg.audio.file_name: ext = msg.audio.file_name.rsplit(".", 1)[-1].lower()
         try: t = await transcribe_audio(msg.audio.file_id, ext)
         except Exception as e: await msg.answer(f"❌ {str(e)[:150]}"); return
-        user_content = t; save_text = f"[Аудио]: {t}"
+        duration = msg.audio.duration
+        user_content = f"[Аудио, {duration} сек]: {t}"
+        save_text = f"[Аудио {duration}с]: {t}"
     elif msg.document:
         doc = msg.document; fname = doc.file_name or "file"
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
@@ -919,7 +1103,6 @@ async def chat(msg: types.Message):
             is_doc_edit = True
         except Exception as e: await msg.answer(f"❌ {str(e)[:150]}"); return
     elif msg.text:
-        # Автодетект кода — без команды
         low = msg.text.lower()
         code_triggers = ["напиши код", "сделай игру", "напиши игру", "сделай сайт", "напиши сайт",
                         "создай игру", "сделай программу", "напиши программу", "создай сайт",
@@ -940,13 +1123,14 @@ async def chat(msg: types.Message):
     tone_add = f"\n\nТОН: {tone}" if tone else ""
     full_prompt = f"[Сейчас: {now}]\n\n" + SYSTEM_PROMPT + personal + tone_add
     try:
-        r = await client.chat.completions.create(model="qwen/qwen3.8-27b",
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
             messages=[{"role": "system", "content": full_prompt}, *history],
-            temperature=0.7, max_tokens=1200)
+            temperature=0.7, max_tokens=1200
+        )
         answer = r.choices[0].message.content
-        # Проверка на пустой ответ
         if not answer or not answer.strip():
-            await msg.answer("...")  # Не отправляем пустое
+            await msg.answer("...")
             return
         await save_message(uid, "assistant", answer)
         if is_doc_edit and doc_info:
@@ -995,7 +1179,7 @@ async def main():
     runner = web.AppRunner(app); await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port); await site.start()
-    logging.info(f"Web server on port {port}")
+    logging.info(f"Web server port {port}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
