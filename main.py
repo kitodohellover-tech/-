@@ -21,6 +21,13 @@ from openai import AsyncOpenAI
 from aiohttp import web
 from PIL import Image
 
+# === PPTX ИМПОРТЫ — ГЛОБАЛЬНО ===
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+from pptx.enum.shapes import MSO_SHAPE
+
 # --- Конфиг ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
@@ -44,7 +51,7 @@ CODE_EXTENSIONS = ["html", "py", "js", "css", "java", "cpp", "sql", "json"]
 MAX_AUTO_PARTS = 10
 
 # ============================================================
-# ПАЛИТРЫ (авто-подбор по теме)
+# ПАЛИТРЫ
 # ============================================================
 PALETTES = {
     "warm":   {"bg": (255, 248, 240), "accent": (224, 122, 95),  "text": (61, 64, 91),   "light": (242, 204, 143)},
@@ -57,7 +64,6 @@ PALETTES = {
 }
 
 def pick_palette(topic: str) -> dict:
-    """Авто-подбор палитры по ключевым словам в теме."""
     low = topic.lower()
     if any(w in low for w in ["космос", "звезд", "галактик", "планет", "астроном", "темн"]):
         return PALETTES["dark"]
@@ -69,9 +75,9 @@ def pick_palette(topic: str) -> dict:
         return PALETTES["nature"]
     if any(w in low for w in ["искусств", "музык", "поэз", "любов", "роман", "девуш", "цвет"]):
         return PALETTES["pink"]
-    if any(w in l for l in [low] for w in ["истор", "деньг", "бизнес", "золот", "богат"]):
+    if any(w in low for w in ["истор", "деньг", "бизнес", "золот", "богат"]):
         return PALETTES["gold"]
-    return PALETTES["purple"]  # дефолт
+    return PALETTES["purple"]
 
 # ============================================================
 # УТИЛИТЫ
@@ -171,35 +177,9 @@ def parse_json_safe(raw: str):
 # ============================================================
 async def improve_prompt(user_request: str, task_type: str = "code") -> str:
     prompts = {
-        "code": (
-            f"Преобразуй запрос пользователя в чёткий промпт для генерации кода.\n"
-            f"Запрос: {user_request}\n\n"
-            f"Правила промпта:\n"
-            f"1. Укажи язык программирования (если не указан — HTML/JS)\n"
-            f"2. Укажи, что писать ТОЛЬКО чистый код, БЕЗ текста и пояснений\n"
-            f"3. Укажи писать ЧАСТЯМИ (максимум 800 токенов)\n"
-            f"4. Укажи маркеры: `// (продолжение следует)` или `// (код готов)`\n"
-            f"5. Всё, что нужно — кратко и по делу\n\n"
-            f"Верни ТОЛЬКО промпт, без пояснений."
-        ),
-        "pptx": (
-            f"Преобразуй запрос пользователя в промпт для генерации презентации.\n"
-            f"Запрос: {user_request}\n\n"
-            f"Правила:\n"
-            f"1. РОВНО 8 слайдов\n"
-            f"2. JSON-формат с полями: title, points, image_prompt, layout\n"
-            f"3. 5-6 пунктов на слайд\n\n"
-            f"Верни ТОЛЬКО промпт."
-        ),
-        "docx": (
-            f"Преобразуй запрос пользователя в промпт для генерации документа.\n"
-            f"Запрос: {user_request}\n\n"
-            f"Правила:\n"
-            f"1. Объём — 1-2 страницы (или больше, если явно указано)\n"
-            f"2. Заголовки разделов\n"
-            f"3. Без markdown\n\n"
-            f"Верни ТОЛЬКО промпт."
-        ),
+        "code": f"Преобразуй запрос в промпт для кода. Запрос: {user_request}. Верни ТОЛЬКО промпт.",
+        "pptx": f"Преобразуй запрос в промпт для презентации. Запрос: {user_request}. Верни ТОЛЬКО промпт.",
+        "docx": f"Преобразуй запрос в промпт для документа. Запрос: {user_request}. Верни ТОЛЬКО промпт.",
     }
     try:
         r = await client.chat.completions.create(
@@ -258,38 +238,30 @@ async def translate_to_english(text: str) -> str:
     except: return text
 
 # ============================================================
-# РЕНДЕР СЛАЙДОВ PPTX
+# РЕНДЕР СЛАЙДОВ (все Inches/Pt/RGBColor — глобальные!)
 # ============================================================
 def add_background(slide, color):
-    """Заливка фона слайда."""
-    from pptx.enum.shapes import MSO_SHAPE
     bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(10), Inches(7.5))
     bg.fill.solid()
     bg.fill.fore_color.rgb = RGBColor(*color)
     bg.line.fill.background()
-    # Отправляем на задний план
     spTree = slide.shapes._spTree
     spTree.remove(bg._element)
     spTree.insert(2, bg._element)
 
 def add_accent_bar(slide, palette, x=Inches(0.5), y=Inches(0.5), w=Inches(1.2), h=Inches(0.15)):
-    """Акцентная полоска."""
-    from pptx.enum.shapes import MSO_SHAPE
     bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, y, w, h)
     bar.fill.solid()
     bar.fill.fore_color.rgb = RGBColor(*palette["accent"])
     bar.line.fill.background()
 
 def add_circle(slide, palette, x, y, size=Inches(0.15)):
-    """Декоративный кружок."""
-    from pptx.enum.shapes import MSO_SHAPE
     c = slide.shapes.add_shape(MSO_SHAPE.OVAL, x, y, size, size)
     c.fill.solid()
     c.fill.fore_color.rgb = RGBColor(*palette["accent"])
     c.line.fill.background()
 
 def add_page_number(slide, num, palette):
-    """Номер слайда в правом нижнем углу."""
     tb = slide.shapes.add_textbox(Inches(9.3), Inches(7.0), Inches(0.5), Inches(0.3))
     p = tb.text_frame.paragraphs[0]
     p.text = str(num)
@@ -298,39 +270,31 @@ def add_page_number(slide, num, palette):
     p.alignment = PP_ALIGN.RIGHT
 
 def add_picture_fit(slide, img_bytes, x, y, max_w, max_h):
-    """Вставляет картинку с сохранением пропорций."""
     img_bytes.seek(0)
     pil = Image.open(img_bytes)
     w, h = pil.size
     ratio = min(max_w / w, max_h / h)
     new_w = int(w * ratio)
     new_h = int(h * ratio)
-    # Центрируем в рамке
     x_offset = x + int((max_w - new_w) / 2)
     y_offset = y + int((max_h - new_h) / 2)
     img_bytes.seek(0)
     slide.shapes.add_picture(img_bytes, x_offset, y_offset, width=new_w, height=new_h)
 
 def render_title(prs, title, subtitle, author, palette):
-    """Титульный слайд."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide, palette["bg"])
-    # Большой акцентный блок слева
-    from pptx.enum.shapes import MSO_SHAPE
     block = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.4), Inches(7.5))
     block.fill.solid(); block.fill.fore_color.rgb = RGBColor(*palette["accent"]); block.line.fill.background()
-    # Заголовок
     tb = slide.shapes.add_textbox(Inches(1), Inches(2.5), Inches(8), Inches(2))
     tf = tb.text_frame; tf.word_wrap = True
     p = tf.paragraphs[0]; p.text = title
     p.font.size = Pt(44); p.font.bold = True
     p.font.color.rgb = RGBColor(*palette["accent"])
-    # Подзаголовок
     if subtitle:
         tb2 = slide.shapes.add_textbox(Inches(1), Inches(4.3), Inches(8), Inches(0.8))
         p2 = tb2.text_frame.paragraphs[0]; p2.text = subtitle
         p2.font.size = Pt(18); p2.font.color.rgb = RGBColor(*palette["text"])
-    # Автор
     if author:
         tb3 = slide.shapes.add_textbox(Inches(1), Inches(5.8), Inches(8), Inches(0.6))
         p3 = tb3.text_frame.paragraphs[0]; p3.text = author
@@ -340,19 +304,14 @@ def render_title(prs, title, subtitle, author, palette):
     add_circle(slide, palette, Inches(9), Inches(1.5), Inches(0.3))
 
 def render_section(prs, title, number, palette):
-    """Слайд-раздел (большая цифра + название)."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide, palette["bg"])
-    # Цветной блок на всю левую половину
-    from pptx.enum.shapes import MSO_SHAPE
     block = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(4.5), Inches(7.5))
     block.fill.solid(); block.fill.fore_color.rgb = RGBColor(*palette["accent"]); block.line.fill.background()
-    # Большая цифра
     tb = slide.shapes.add_textbox(Inches(0.5), Inches(2), Inches(3.5), Inches(3))
     p = tb.text_frame.paragraphs[0]; p.text = number or "01"
     p.font.size = Pt(120); p.font.bold = True
     p.font.color.rgb = RGBColor(255, 255, 255)
-    # Название справа
     tb2 = slide.shapes.add_textbox(Inches(5.2), Inches(3), Inches(4.5), Inches(2))
     tf = tb2.text_frame; tf.word_wrap = True
     p2 = tf.paragraphs[0]; p2.text = title
@@ -360,21 +319,16 @@ def render_section(prs, title, number, palette):
     p2.font.color.rgb = RGBColor(*palette["text"])
 
 def render_bullets(prs, title, points, palette, num):
-    """Обычный текстовый слайд."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide, palette["bg"])
     add_accent_bar(slide, palette)
-    # Заголовок
     tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(9), Inches(1))
     tf = tb.text_frame; tf.word_wrap = True
     p = tf.paragraphs[0]; p.text = title
     p.font.size = Pt(32); p.font.bold = True
     p.font.color.rgb = RGBColor(*palette["text"])
-    # Линия-разделитель
-    from pptx.enum.shapes import MSO_SHAPE
     line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.5), Inches(2), Inches(9), Inches(0.03))
     line.fill.solid(); line.fill.fore_color.rgb = RGBColor(*palette["light"]); line.line.fill.background()
-    # Пункты с кружками
     y = Inches(2.4)
     for pt in points[:6]:
         add_circle(slide, palette, Inches(0.7), y + Inches(0.1), Inches(0.15))
@@ -386,17 +340,14 @@ def render_bullets(prs, title, points, palette, num):
     add_page_number(slide, num, palette)
 
 def render_text_image(prs, title, points, img_bytes, palette, num):
-    """Текст слева, картинка справа."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide, palette["bg"])
     add_accent_bar(slide, palette)
-    # Заголовок
     tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(4.5), Inches(1.5))
     tf = tb.text_frame; tf.word_wrap = True
     p = tf.paragraphs[0]; p.text = title
     p.font.size = Pt(28); p.font.bold = True
     p.font.color.rgb = RGBColor(*palette["text"])
-    # Пункты
     y = Inches(2.5)
     for pt in points[:5]:
         add_circle(slide, palette, Inches(0.7), y + Inches(0.1), Inches(0.12))
@@ -405,7 +356,6 @@ def render_text_image(prs, title, points, img_bytes, palette, num):
         p2 = tf2.paragraphs[0]; p2.text = pt
         p2.font.size = Pt(13); p2.font.color.rgb = RGBColor(*palette["text"])
         y += Inches(0.7)
-    # Картинка справа
     if img_bytes:
         try:
             add_picture_fit(slide, img_bytes, Inches(5.3), Inches(1.8), Inches(4.4), Inches(5.2))
@@ -414,21 +364,17 @@ def render_text_image(prs, title, points, img_bytes, palette, num):
     add_page_number(slide, num, palette)
 
 def render_quote(prs, title, quote, author, palette, num):
-    """Слайд с цитатой."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide, palette["bg"])
-    # Большая кавычка
     tb0 = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(2), Inches(1.5))
     p0 = tb0.text_frame.paragraphs[0]; p0.text = '"'
     p0.font.size = Pt(120); p0.font.bold = True
     p0.font.color.rgb = RGBColor(*palette["accent"])
-    # Цитата
     tb = slide.shapes.add_textbox(Inches(1.5), Inches(2.5), Inches(7), Inches(3))
     tf = tb.text_frame; tf.word_wrap = True
     p = tf.paragraphs[0]; p.text = quote or title
     p.font.size = Pt(24); p.font.italic = True
     p.font.color.rgb = RGBColor(*palette["text"])
-    # Автор
     if author:
         tb2 = slide.shapes.add_textbox(Inches(1.5), Inches(5.5), Inches(7), Inches(0.6))
         p2 = tb2.text_frame.paragraphs[0]; p2.text = "— " + author
@@ -437,30 +383,28 @@ def render_quote(prs, title, quote, author, palette, num):
     add_page_number(slide, num, palette)
 
 def render_stats(prs, title, stats, palette, num):
-    """Слайд со статистикой (3 больших числа)."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide, palette["bg"])
     add_accent_bar(slide, palette)
-    # Заголовок
     tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(9), Inches(1))
     p = tb.text_frame.paragraphs[0]; p.text = title
     p.font.size = Pt(32); p.font.bold = True
     p.font.color.rgb = RGBColor(*palette["text"])
-    # 3 колонки
-    stats = stats[:3] if stats else [{"value": "100+", "label": "фактов"}]
+    if not stats or not isinstance(stats, list):
+        stats = [{"value": "100+", "label": "фактов"}]
+    stats = [s for s in stats if isinstance(s, dict)][:3]
+    if not stats:
+        stats = [{"value": "100+", "label": "фактов"}]
     cols = len(stats)
     col_w = Inches(9) / cols
     x = Inches(0.5)
     for stat in stats:
-        if not isinstance(stat, dict): continue
-        # Число
         tb2 = slide.shapes.add_textbox(x, Inches(3), col_w, Inches(1.5))
         p2 = tb2.text_frame.paragraphs[0]
         p2.text = str(stat.get("value", "0"))
         p2.font.size = Pt(60); p2.font.bold = True
         p2.font.color.rgb = RGBColor(*palette["accent"])
         p2.alignment = PP_ALIGN.CENTER
-        # Подпись
         tb3 = slide.shapes.add_textbox(x, Inches(4.5), col_w, Inches(1))
         tf3 = tb3.text_frame; tf3.word_wrap = True
         p3 = tf3.paragraphs[0]; p3.text = stat.get("label", "")
@@ -470,10 +414,8 @@ def render_stats(prs, title, stats, palette, num):
     add_page_number(slide, num, palette)
 
 def render_final(prs, title, palette, num):
-    """Финальный слайд."""
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_background(slide, palette["bg"])
-    from pptx.enum.shapes import MSO_SHAPE
     block = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(2.5), Inches(2.5), Inches(5), Inches(2.5))
     block.fill.solid(); block.fill.fore_color.rgb = RGBColor(*palette["accent"]); block.line.fill.background()
     tb = slide.shapes.add_textbox(Inches(2.5), Inches(3), Inches(5), Inches(1.5))
@@ -486,14 +428,6 @@ def render_final(prs, title, palette, num):
     add_circle(slide, palette, Inches(8.5), Inches(6), Inches(0.4))
 
 def build_pptx(slides_data, topic):
-    """Собирает .pptx с новыми layout'ами."""
-    from pptx import Presentation
-    from pptx.util import Inches, Pt
-    from pptx.dml.color import RGBColor
-    from pptx.enum.text import PP_ALIGN
-    from pptx.enum.shapes import MSO_SHAPE
-    global Inches, Pt, RGBColor, PP_ALIGN, MSO_SHAPE  # для вложенных функций
-
     palette = pick_palette(topic)
     prs = Presentation()
     prs.slide_width = Inches(10)
@@ -505,15 +439,13 @@ def build_pptx(slides_data, topic):
         title = s.get("title", f"Слайд {i+1}")
         points = s.get("points", [])
         num = i + 1
-
         try:
             if layout == "title" or i == 0:
                 render_title(prs, title, s.get("subtitle", ""), s.get("author", ""), palette)
             elif layout == "section":
                 render_section(prs, title, s.get("number", f"{i:02d}"), palette)
             elif layout == "text_image":
-                img = s.get("_image_bytes")
-                render_text_image(prs, title, points, img, palette, num)
+                render_text_image(prs, title, points, s.get("_image_bytes"), palette, num)
             elif layout == "quote":
                 render_quote(prs, title, s.get("quote", ""), s.get("author", ""), palette, num)
             elif layout == "stats":
@@ -524,12 +456,10 @@ def build_pptx(slides_data, topic):
                 render_bullets(prs, title, points, palette, num)
         except Exception as e:
             logging.error(f"Slide {i+1} error: {e}")
-            # Fallback — простой слайд
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(9), Inches(6))
             tb.text_frame.text = title + "\n\n" + "\n".join(f"• {p}" for p in points)
 
-    # Сохраняем через временный файл
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
         tmp_path = tmp.name
     prs.save(tmp_path)
@@ -551,7 +481,6 @@ async def read_document(file_id: str, fname: str) -> str:
         from docx import Document
         return "\n".join(p.text for p in Document(buf).paragraphs if p.text.strip())
     elif ext == "pptx":
-        from pptx import Presentation
         parts = []
         for i, s in enumerate(Presentation(buf).slides):
             parts.append(f"--- Слайд {i+1} ---")
@@ -728,7 +657,7 @@ def code_keyboard(project_id: str, is_complete: bool = False, auto_mode: bool = 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ============================================================
-# ХЕНДЛЕРЫ (команды)
+# ХЕНДЛЕРЫ
 # ============================================================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -773,9 +702,6 @@ async def set_tone_cmd(msg: types.Message):
     if not t: await msg.answer("Напиши, как хочешь общаться."); return
     await set_user_tone(msg.from_user.id, t); await msg.answer(f"Принял: _{t}_")
 
-# ============================================================
-# /e — универсальная
-# ============================================================
 @dp.message(Command("e"))
 async def universal_e(msg: types.Message):
     uid = msg.from_user.id
@@ -808,226 +734,12 @@ async def detect_intent(request: str) -> str:
         return r.choices[0].message.content.strip().lower()
     except: return "chat"
 
-# ============================================================
-# КОД
-# ============================================================
-async def make_code(msg: types.Message, request: str = None, auto: bool = False):
-    uid = msg.from_user.id
-    if not request: request = msg.text
-    active = await get_active_code(uid)
-    if active and "продолж" in request.lower():
-        project_id = active['project_id']; topic = active['topic']
-    else:
-        project_id = f"code_{uid}_{int(datetime.now().timestamp())}"
-        topic = request[:100]
-        await log_process_start(uid, "code", topic)
-
-    await bot.send_chat_action(msg.chat.id, "typing")
-    if not auto:
-        status = await msg.answer("💻 Готовлю промпт...")
-    try:
-        old_parts = await get_code_parts(uid, project_id)
-        old_code = "\n\n".join(old_parts) if old_parts else ""
-        next_part = len(old_parts) + 1
-
-        if not old_code:
-            improved = await improve_prompt(request, "code")
-            logging.info(f"[AUTOPROMPT] '{request[:50]}' → '{improved[:100]}'")
-        else:
-            improved = None
-
-        if old_code:
-            prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
-                      f"```\n{old_code[-2500:]}\n```\n\n"
-                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста типа «вот продолжение». БЕЗ пояснений. "
-                      f"Продолжай с последней строки. НЕ повторяй функции, которые уже есть. "
-                      f"Часть {next_part}. Максимум 800 токенов. "
-                      f"В САМОМ КОНЦЕ ответа ОБЯЗАТЕЛЬНО напиши ОДНУ строку: `// (продолжение следует)` или `// (код готов)`.")
-        else:
-            prompt = (f"{improved}\n\n"
-                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста типа «вот твой код» и БЕЗ объяснений. "
-                      f"Пиши ЧАСТЯМИ. Максимум 800 токенов за раз. "
-                      f"Заканчивай часть на ЛОГИЧЕСКИ ЗАВЕРШЁННОМ блоке (не обрывай функцию посередине). "
-                      f"В САМОМ КОНЦЕ ответа ОБЯЗАТЕЛЬНО напиши ОДНУ строку: `// (продолжение следует)` или `// (код готов)`.")
-
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=1200
-        )
-        answer = r.choices[0].message.content
-        code = extract_code(answer)
-        if not code or len(code.strip()) < 10:
-            await msg.answer("❌ Пустой ответ. Попробуй ещё раз.")
-            return
-        await save_code_part(uid, project_id, next_part, code, topic)
-        all_parts = await get_code_parts(uid, project_id)
-        partial = "\n\n".join(all_parts)
-        ext = detect_extension(partial)
-        if ext == "txt": ext = "html"
-        is_complete = is_code_complete(answer)
-
-        if auto and not is_complete:
-            if next_part < MAX_AUTO_PARTS:
-                await continue_code_auto(msg, uid, project_id, next_part + 1)
-                return
-            else:
-                await msg.answer(f"⏸ Достигнут лимит {MAX_AUTO_PARTS} частей. Продолжи вручную.")
-
-        comment = await get_file_comment(f"код .{ext}", topic[:50], uid)
-        kb = code_keyboard(project_id, is_complete=is_complete)
-        await msg.answer_document(
-            BufferedInputFile(partial.encode("utf-8"), filename=f"code_part{next_part}.{ext}"),
-            caption=f"{comment}\n\n📄 Часть {next_part}",
-            reply_markup=kb
-        )
-    except Exception as e:
-        logging.error(f"CODE error: {e}"); await msg.answer(f"❌ {str(e)[:200]}")
-
-async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
-    try:
-        old_parts = await get_code_parts(uid, project_id)
-        old_code = "\n\n".join(old_parts)
-        async with db_pool.acquire() as c:
-            row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
-        topic = row['topic'] if row else "code"
-
-        prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
-                  f"```\n{old_code[-2500:]}\n```\n\n"
-                  f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. НЕ повторяй функции, которые уже есть. "
-                  f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
-                  f"В САМОМ КОНЦЕ ответа ОБЯЗАТЕЛЬНО напиши ОДНУ строку: `// (продолжение следует)` или `// (код готов)`.")
-
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=1200
-        )
-        answer = r.choices[0].message.content
-        code = extract_code(answer)
-        if not code or len(code.strip()) < 10:
-            await msg.answer("⏸ Пустой ответ. Остановка.")
-            return
-        await save_code_part(uid, project_id, next_part, code, topic)
-        all_parts = await get_code_parts(uid, project_id)
-        partial = "\n\n".join(all_parts)
-        ext = detect_extension(partial)
-        if ext == "txt": ext = "html"
-        is_complete = is_code_complete(answer)
-
-        if is_complete:
-            await finish_code(uid, project_id)
-            await log_process_finish(uid, "code", len(all_parts))
-            comment = await get_file_comment(f"финальный код .{ext}", topic[:50], uid)
-            await msg.answer_document(
-                BufferedInputFile(partial.encode("utf-8"), filename=f"final.{ext}"),
-                caption=f"✅ {comment}\n\n📦 Склеено из {len(all_parts)} частей",
-                reply_markup=code_keyboard(project_id, is_complete=True)
-            )
-        else:
-            if next_part < MAX_AUTO_PARTS:
-                await continue_code_auto(msg, uid, project_id, next_part + 1)
-            else:
-                await msg.answer(f"⏸ Лимит {MAX_AUTO_PARTS} частей. Продолжи вручную.")
-    except Exception as e:
-        logging.error(f"continue_code_auto error: {e}")
-        await msg.answer(f"❌ Ошибка в авто-режиме: {str(e)[:200]}")
-
-async def continue_code(msg, uid: int, project_id: str):
-    status = await msg.answer("💻 Дописываю...")
-    try:
-        old_parts = await get_code_parts(uid, project_id)
-        old_code = "\n\n".join(old_parts)
-        next_part = len(old_parts) + 1
-        async with db_pool.acquire() as c:
-            row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
-        topic = row['topic'] if row else "code"
-        prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
-                  f"```\n{old_code[-2500:]}\n```\n\n"
-                  f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. НЕ повторяй функции. "
-                  f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
-                  f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=1200
-        )
-        answer = r.choices[0].message.content
-        code = extract_code(answer)
-        if not code or len(code.strip()) < 10:
-            await status.edit_text("❌ Пустой ответ."); return
-        await save_code_part(uid, project_id, next_part, code, topic)
-        all_parts = await get_code_parts(uid, project_id)
-        partial = "\n\n".join(all_parts)
-        ext = detect_extension(partial)
-        if ext == "txt": ext = "html"
-        comment = await get_file_comment(f"код .{ext}", topic[:50], uid)
-        is_complete = is_code_complete(answer)
-        kb = code_keyboard(project_id, is_complete=is_complete)
-        await msg.answer_document(
-            BufferedInputFile(partial.encode("utf-8"), filename=f"code_part{next_part}.{ext}"),
-            caption=f"{comment}\n\n📄 Часть {next_part}",
-            reply_markup=kb
-        )
-        await status.delete()
-    except Exception as e:
-        logging.error(f"continue_code error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
-
-@dp.message(Command("code"))
-async def cmd_code(msg: types.Message):
-    await make_code(msg)
-
-@dp.callback_query(F.data.startswith("code_cont_"))
-async def code_continue(cb: types.CallbackQuery):
-    project_id = cb.data.replace("code_cont_", "")
-    await cb.answer("Продолжаю...")
-    await continue_code(cb.message, cb.from_user.id, project_id)
-
-@dp.callback_query(F.data.startswith("code_done_"))
-async def code_done(cb: types.CallbackQuery):
-    project_id = cb.data.replace("code_done_", "")
-    await cb.answer("Завершаю...")
-    parts = await get_code_parts(cb.from_user.id, project_id)
-    full = "\n\n".join(parts)
-    await finish_code(cb.from_user.id, project_id)
-    await log_process_finish(cb.from_user.id, "code", len(parts))
-    ext = detect_extension(full)
-    if ext == "txt": ext = "html"
-    async with db_pool.acquire() as c:
-        row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", cb.from_user.id, project_id)
-    topic = row['topic'] if row else "code"
-    comment = await get_file_comment(f"финальный код .{ext}", topic[:50], cb.from_user.id)
-    await cb.message.answer_document(
-        BufferedInputFile(full.encode("utf-8"), filename=f"final.{ext}"),
-        caption=f"✅ {comment}",
-        reply_markup=code_keyboard(project_id, is_complete=True)
-    )
-
-@dp.callback_query(F.data.startswith("code_auto_"))
-async def code_auto(cb: types.CallbackQuery):
-    project_id = cb.data.replace("code_auto_", "")
-    await cb.answer("⏩ Авто-режим запущен...")
-    await cb.message.answer("⏩ Авто-режим: дописываю до конца. Не жди, я сообщу.")
-    old_parts = await get_code_parts(cb.from_user.id, project_id)
-    next_part = len(old_parts) + 1
-    await continue_code_auto(cb.message, cb.from_user.id, project_id, next_part)
-
-@dp.callback_query(F.data.startswith("code_restart_"))
-async def code_restart(cb: types.CallbackQuery):
-    project_id = cb.data.replace("code_restart_", "")
-    await cb.answer("Начинаю заново...")
-    await delete_code(cb.from_user.id, project_id)
-    await cb.message.answer("🔄 Начинаю заново. Напиши, что нужно сделать.")
-
-# ============================================================
-# ПРЕЗЕНТАЦИЯ (НОВАЯ)
-# ============================================================
+# === ПРЕЗЕНТАЦИЯ (НОВАЯ, с жёсткими layout'ами) ===
 async def make_pptx(msg: types.Message, topic: str = None):
     uid = msg.from_user.id
     if not topic: topic = msg.text.replace("/pptx", "").strip()
     if not topic: await msg.answer("📊 `/pptx тема`"); return
 
-    # Парсим автора
     author = ""
     m = re.search(r'автор[:\s]+([А-ЯЁA-Z][а-яёa-z]+(?:\s+[А-ЯЁA-Z][а-яёa-z]+)?)', topic, re.IGNORECASE)
     if m:
@@ -1037,26 +749,31 @@ async def make_pptx(msg: types.Message, topic: str = None):
     await bot.send_chat_action(msg.chat.id, "typing")
     status = await msg.answer(f"📊 Готовлю: _{topic}_...")
     try:
-        improved = await improve_prompt(topic, "pptx")
-        prompt = (f"{improved}\n\n"
-                  f"Верни ТОЛЬКО JSON-массив БЕЗ текста вокруг. Никаких пояснений, только [ ... ].\n"
-                  f'СТРОГИЙ формат каждого элемента: {{"title": "Заголовок", "points": ["пункт1", "пункт2"], "image_prompt": "english prompt", "layout": "bullets"}}\n'
-                  f"layout может быть: title, section, bullets, text_image, quote, stats, final\n"
-                  f"Правила:\n"
-                  f"- 1-й слайд — title\n"
-                  f"- Последний — final\n"
-                  f"- 2-3 слайда text_image (с картинкой)\n"
-                  f"- 1 слайд stats (с цифрами)\n"
-                  f"- 1 слайд quote (с цитатой)\n"
-                  f"- Остальные — bullets или section\n"
-                  f"- РОВНО 8 слайдов\n"
-                  f"- В каждом элементе поля: title, points, image_prompt, layout\n"
-                  f"ВАЖНО: каждый элемент массива — ОБЪЕКТ {{}}, не строка.")
+        prompt = (f"Тема презентации: {topic}\n\n"
+                  f"Верни ТОЛЬКО JSON-массив БЕЗ текста вокруг. Только [ ... ].\n"
+                  f'Формат: [{{"title": "...", "points": ["...","..."], "image_prompt": "...", "layout": "..."}}, ...]\n'
+                  f"\n"
+                  f"ЯЗЫК:\n"
+                  f"- title и points — НА РУССКОМ ЯЗЫКЕ\n"
+                  f"- image_prompt — НА АНГЛИЙСКОМ (для поиска картинок)\n"
+                  f"\n"
+                  f"LAYOUT'Ы (СТРОГО!):\n"
+                  f"- Слайд 1: layout=\"title\"\n"
+                  f"- Слайд 2: layout=\"text_image\"\n"
+                  f"- Слайд 3: layout=\"bullets\"\n"
+                  f"- Слайд 4: layout=\"text_image\"\n"
+                  f"- Слайд 5: layout=\"stats\" (добавь поле stats: [{{\"value\":\"100+\",\"label\":\"факт\"}}])\n"
+                  f"- Слайд 6: layout=\"quote\" (добавь поле quote: \"цитата\", author: \"кто сказал\")\n"
+                  f"- Слайд 7: layout=\"text_image\"\n"
+                  f"- Слайд 8: layout=\"final\"\n"
+                  f"\n"
+                  f"РОВНО 8 слайдов. В каждом 5-6 пунктов в points. "
+                  f"Каждый элемент массива — ОБЪЕКТ {{}}, не строка.")
 
         r = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.6, max_tokens=2000
+            temperature=0.6, max_tokens=2500
         )
         slides = parse_json_safe(r.choices[0].message.content)
         if not slides:
@@ -1068,9 +785,8 @@ async def make_pptx(msg: types.Message, topic: str = None):
             return
 
         total = len(slides)
-        await status.edit_text(f"📊 Ищу картинки ({total})...")
+        await status.edit_text(f"📊 Ищу картинки...")
 
-        # Картинки ТОЛЬКО для text_image слайдов
         for s in slides:
             if s.get("layout") == "text_image":
                 q = s.get("image_prompt", s.get("title", "abstract"))
@@ -1078,6 +794,10 @@ async def make_pptx(msg: types.Message, topic: str = None):
                 if not img:
                     img = await generate_image_hf(q)
                 s["_image_bytes"] = img
+
+        # Автор в титул
+        if author and slides:
+            slides[0]["author"] = author
 
         await status.edit_text(f"📊 Собираю презентацию...")
 
@@ -1098,9 +818,7 @@ async def make_pptx(msg: types.Message, topic: str = None):
 async def cmd_pptx(msg: types.Message):
     await make_pptx(msg)
 
-# ============================================================
-# ДОКУМЕНТ
-# ============================================================
+# === ДОКУМЕНТ ===
 async def make_docx(msg: types.Message, topic: str = None):
     uid = msg.from_user.id
     if not topic: topic = msg.text.replace("/docx", "").strip()
@@ -1208,9 +926,211 @@ async def doc_done(cb: types.CallbackQuery):
     safe = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
     await cb.message.answer_document(FSInputFile(path, filename=f"{safe}.docx"), caption=f"✅ {comment}")
 
-# ============================================================
-# КАРТИНКА
-# ============================================================
+# === КОД ===
+async def make_code(msg: types.Message, request: str = None, auto: bool = False):
+    uid = msg.from_user.id
+    if not request: request = msg.text
+    active = await get_active_code(uid)
+    if active and "продолж" in request.lower():
+        project_id = active['project_id']; topic = active['topic']
+    else:
+        project_id = f"code_{uid}_{int(datetime.now().timestamp())}"
+        topic = request[:100]
+        await log_process_start(uid, "code", topic)
+
+    await bot.send_chat_action(msg.chat.id, "typing")
+    if not auto:
+        status = await msg.answer("💻 Готовлю промпт...")
+    try:
+        old_parts = await get_code_parts(uid, project_id)
+        old_code = "\n\n".join(old_parts) if old_parts else ""
+        next_part = len(old_parts) + 1
+
+        if not old_code:
+            improved = await improve_prompt(request, "code")
+        else:
+            improved = None
+
+        if old_code:
+            prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
+                      f"```\n{old_code[-2500:]}\n```\n\n"
+                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. "
+                      f"Продолжай с последней строки. НЕ повторяй функции. "
+                      f"Часть {next_part}. Максимум 800 токенов. "
+                      f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
+        else:
+            prompt = (f"{improved}\n\n"
+                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста и объяснений. "
+                      f"Пиши ЧАСТЯМИ. Максимум 800 токенов за раз. "
+                      f"Заканчивай часть на ЛОГИЧЕСКИ ЗАВЕРШЁННОМ блоке. "
+                      f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
+
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=1200
+        )
+        answer = r.choices[0].message.content
+        code = extract_code(answer)
+        if not code or len(code.strip()) < 10:
+            await msg.answer("❌ Пустой ответ."); return
+        await save_code_part(uid, project_id, next_part, code, topic)
+        all_parts = await get_code_parts(uid, project_id)
+        partial = "\n\n".join(all_parts)
+        ext = detect_extension(partial)
+        if ext == "txt": ext = "html"
+        is_complete = is_code_complete(answer)
+
+        if auto and not is_complete:
+            if next_part < MAX_AUTO_PARTS:
+                await continue_code_auto(msg, uid, project_id, next_part + 1)
+                return
+            else:
+                await msg.answer(f"⏸ Лимит {MAX_AUTO_PARTS} частей.")
+
+        comment = await get_file_comment(f"код .{ext}", topic[:50], uid)
+        kb = code_keyboard(project_id, is_complete=is_complete)
+        await msg.answer_document(
+            BufferedInputFile(partial.encode("utf-8"), filename=f"code_part{next_part}.{ext}"),
+            caption=f"{comment}\n\n📄 Часть {next_part}",
+            reply_markup=kb
+        )
+    except Exception as e:
+        logging.error(f"CODE error: {e}"); await msg.answer(f"❌ {str(e)[:200]}")
+
+async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
+    try:
+        old_parts = await get_code_parts(uid, project_id)
+        old_code = "\n\n".join(old_parts)
+        async with db_pool.acquire() as c:
+            row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
+        topic = row['topic'] if row else "code"
+
+        prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
+                  f"```\n{old_code[-2500:]}\n```\n\n"
+                  f"ПИШИ ТОЛЬКО КОД. НЕ повторяй функции. "
+                  f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
+                  f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
+
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=1200
+        )
+        answer = r.choices[0].message.content
+        code = extract_code(answer)
+        if not code or len(code.strip()) < 10:
+            await msg.answer("⏸ Пустой ответ."); return
+        await save_code_part(uid, project_id, next_part, code, topic)
+        all_parts = await get_code_parts(uid, project_id)
+        partial = "\n\n".join(all_parts)
+        ext = detect_extension(partial)
+        if ext == "txt": ext = "html"
+        is_complete = is_code_complete(answer)
+
+        if is_complete:
+            await finish_code(uid, project_id)
+            await log_process_finish(uid, "code", len(all_parts))
+            comment = await get_file_comment(f"финальный код .{ext}", topic[:50], uid)
+            await msg.answer_document(
+                BufferedInputFile(partial.encode("utf-8"), filename=f"final.{ext}"),
+                caption=f"✅ {comment}\n\n📦 Склеено из {len(all_parts)} частей",
+                reply_markup=code_keyboard(project_id, is_complete=True)
+            )
+        else:
+            if next_part < MAX_AUTO_PARTS:
+                await continue_code_auto(msg, uid, project_id, next_part + 1)
+            else:
+                await msg.answer(f"⏸ Лимит {MAX_AUTO_PARTS} частей.")
+    except Exception as e:
+        logging.error(f"continue_code_auto error: {e}")
+        await msg.answer(f"❌ {str(e)[:200]}")
+
+async def continue_code(msg, uid: int, project_id: str):
+    status = await msg.answer("💻 Дописываю...")
+    try:
+        old_parts = await get_code_parts(uid, project_id)
+        old_code = "\n\n".join(old_parts)
+        next_part = len(old_parts) + 1
+        async with db_pool.acquire() as c:
+            row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
+        topic = row['topic'] if row else "code"
+        prompt = (f"Продолжи код:\n```\n{old_code[-2500:]}\n```\n\n"
+                  f"ПИШИ ТОЛЬКО КОД. Часть {next_part}. Максимум 800 токенов. "
+                  f"В САМОМ КОНЦЕ: `// (продолжение следует)` или `// (код готов)`.")
+        r = await client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=1200
+        )
+        answer = r.choices[0].message.content
+        code = extract_code(answer)
+        if not code or len(code.strip()) < 10:
+            await status.edit_text("❌ Пустой ответ."); return
+        await save_code_part(uid, project_id, next_part, code, topic)
+        all_parts = await get_code_parts(uid, project_id)
+        partial = "\n\n".join(all_parts)
+        ext = detect_extension(partial)
+        if ext == "txt": ext = "html"
+        comment = await get_file_comment(f"код .{ext}", topic[:50], uid)
+        is_complete = is_code_complete(answer)
+        kb = code_keyboard(project_id, is_complete=is_complete)
+        await msg.answer_document(
+            BufferedInputFile(partial.encode("utf-8"), filename=f"code_part{next_part}.{ext}"),
+            caption=f"{comment}\n\n📄 Часть {next_part}",
+            reply_markup=kb
+        )
+        await status.delete()
+    except Exception as e:
+        logging.error(f"continue_code error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
+
+@dp.message(Command("code"))
+async def cmd_code(msg: types.Message):
+    await make_code(msg)
+
+@dp.callback_query(F.data.startswith("code_cont_"))
+async def code_continue(cb: types.CallbackQuery):
+    project_id = cb.data.replace("code_cont_", "")
+    await cb.answer("Продолжаю...")
+    await continue_code(cb.message, cb.from_user.id, project_id)
+
+@dp.callback_query(F.data.startswith("code_done_"))
+async def code_done(cb: types.CallbackQuery):
+    project_id = cb.data.replace("code_done_", "")
+    await cb.answer("Завершаю...")
+    parts = await get_code_parts(cb.from_user.id, project_id)
+    full = "\n\n".join(parts)
+    await finish_code(cb.from_user.id, project_id)
+    await log_process_finish(cb.from_user.id, "code", len(parts))
+    ext = detect_extension(full)
+    if ext == "txt": ext = "html"
+    async with db_pool.acquire() as c:
+        row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", cb.from_user.id, project_id)
+    topic = row['topic'] if row else "code"
+    comment = await get_file_comment(f"финальный код .{ext}", topic[:50], cb.from_user.id)
+    await cb.message.answer_document(
+        BufferedInputFile(full.encode("utf-8"), filename=f"final.{ext}"),
+        caption=f"✅ {comment}",
+        reply_markup=code_keyboard(project_id, is_complete=True)
+    )
+
+@dp.callback_query(F.data.startswith("code_auto_"))
+async def code_auto(cb: types.CallbackQuery):
+    project_id = cb.data.replace("code_auto_", "")
+    await cb.answer("⏩ Авто-режим...")
+    await cb.message.answer("⏩ Авто-режим: дописываю до конца.")
+    old_parts = await get_code_parts(cb.from_user.id, project_id)
+    next_part = len(old_parts) + 1
+    await continue_code_auto(cb.message, cb.from_user.id, project_id, next_part)
+
+@dp.callback_query(F.data.startswith("code_restart_"))
+async def code_restart(cb: types.CallbackQuery):
+    project_id = cb.data.replace("code_restart_", "")
+    await cb.answer("Начинаю заново...")
+    await delete_code(cb.from_user.id, project_id)
+    await cb.message.answer("🔄 Начинаю заново.")
+
+# === КАРТИНКА ===
 async def make_image(msg: types.Message, prompt: str = None):
     uid = msg.from_user.id
     if not prompt: prompt = msg.text.replace("/image", "").strip()
@@ -1221,7 +1141,7 @@ async def make_image(msg: types.Message, prompt: str = None):
         prompt_en = await translate_to_english(prompt)
         img = await generate_image_hf(prompt_en); src = "HF"
         if not img:
-            await status.edit_text("🔍 HF не ответил — ищу фото...")
+            await status.edit_text("🔍 HF не ответил...")
             img = await search_stock_photo(prompt_en); src = "Pexafy"
         if not img:
             await status.edit_text("❌ Не удалось."); return
@@ -1236,9 +1156,7 @@ async def make_image(msg: types.Message, prompt: str = None):
 async def cmd_image(msg: types.Message):
     await make_image(msg)
 
-# ============================================================
-# РЕЧЬ
-# ============================================================
+# === РЕЧЬ ===
 @dp.message(Command("speech"))
 async def make_speech(msg: types.Message):
     uid = msg.from_user.id
@@ -1270,9 +1188,7 @@ async def make_speech(msg: types.Message):
     except Exception as e:
         logging.error(f"SPEECH error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
 
-# ============================================================
-# ДОРАБОТКА ДОКУМЕНТОВ
-# ============================================================
+# === ДОРАБОТКА ДОКУМЕНТОВ ===
 async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, uid):
     try:
         safe = "".join(c for c in file_name if c.isalnum() or c in " .-_")
@@ -1322,9 +1238,7 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, uid
     except Exception as e:
         logging.error(f"Doc edit: {e}"); await msg.answer(f"❌ {str(e)[:200]}")
 
-# ============================================================
-# ОСНОВНОЙ ОБРАБОТЧИК
-# ============================================================
+# === ОСНОВНОЙ ОБРАБОТЧИК ===
 @dp.message()
 async def chat(msg: types.Message):
     uid = msg.from_user.id
@@ -1434,9 +1348,7 @@ async def chat(msg: types.Message):
         else:
             await msg.answer(f"❌ {err[:300]}")
 
-# ============================================================
-# ВЕБ-СЕРВЕР
-# ============================================================
+# === ВЕБ-СЕРВЕР ===
 async def handle(request): return web.Response(text="Bot is running!")
 
 async def main():
