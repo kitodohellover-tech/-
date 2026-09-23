@@ -5,6 +5,7 @@ import base64
 import json
 import re
 import io
+import tempfile
 from io import BytesIO
 from datetime import datetime
 import asyncpg
@@ -18,6 +19,7 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from openai import AsyncOpenAI
 from aiohttp import web
+from PIL import Image
 
 # --- Конфиг ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -39,10 +41,41 @@ db_pool = None
 HISTORY_LIMIT = 20
 MAX_CONTEXT_CHARS = 15000
 CODE_EXTENSIONS = ["html", "py", "js", "css", "java", "cpp", "sql", "json"]
-MAX_AUTO_PARTS = 10  # Максимум частей в режиме авто
+MAX_AUTO_PARTS = 10
 
+# ============================================================
+# ПАЛИТРЫ (авто-подбор по теме)
+# ============================================================
+PALETTES = {
+    "warm":   {"bg": (255, 248, 240), "accent": (224, 122, 95),  "text": (61, 64, 91),   "light": (242, 204, 143)},
+    "cool":   {"bg": (240, 244, 248), "accent": (61, 90, 128),   "text": (41, 50, 65),   "light": (152, 193, 217)},
+    "nature": {"bg": (244, 249, 244), "accent": (45, 106, 79),   "text": (27, 67, 50),   "light": (149, 213, 178)},
+    "dark":   {"bg": (26, 26, 46),    "accent": (233, 69, 96),   "text": (255, 255, 255),"light": (22, 33, 62)},
+    "purple": {"bg": (245, 240, 255), "accent": (124, 58, 237),  "text": (45, 45, 58),   "light": (196, 181, 253)},
+    "pink":   {"bg": (255, 240, 245), "accent": (219, 39, 119),  "text": (45, 45, 58),   "light": (249, 168, 212)},
+    "gold":   {"bg": (255, 251, 235), "accent": (217, 119, 6),   "text": (41, 37, 36),   "light": (252, 211, 77)},
+}
 
-# --- Утилиты ---
+def pick_palette(topic: str) -> dict:
+    """Авто-подбор палитры по ключевым словам в теме."""
+    low = topic.lower()
+    if any(w in low for w in ["космос", "звезд", "галактик", "планет", "астроном", "темн"]):
+        return PALETTES["dark"]
+    if any(w in low for w in ["кошк", "собак", "животн", "природа", "цвет", "сад", "лес"]):
+        return PALETTES["warm"]
+    if any(w in low for w in ["мор", "океан", "вод", "неб", "холод", "зим"]):
+        return PALETTES["cool"]
+    if any(w in low for w in ["эколог", "растен", "биолог", "здоров", "медицин"]):
+        return PALETTES["nature"]
+    if any(w in low for w in ["искусств", "музык", "поэз", "любов", "роман", "девуш", "цвет"]):
+        return PALETTES["pink"]
+    if any(w in l for l in [low] for w in ["истор", "деньг", "бизнес", "золот", "богат"]):
+        return PALETTES["gold"]
+    return PALETTES["purple"]  # дефолт
+
+# ============================================================
+# УТИЛИТЫ
+# ============================================================
 def split_message(text: str, limit: int = 4000) -> list[str]:
     if len(text) <= limit: return [text]
     parts = []
@@ -76,7 +109,6 @@ def detect_extension(text: str) -> str:
     return "txt"
 
 def clean_code(text: str) -> str:
-    """Жёстко чистит код от мусора и маркеров."""
     text = text.replace("[file content end]", "").replace("[file content begin]", "")
     text = text.replace("// (продолжение следует)", "").replace("// (код готов)", "")
     text = text.replace("(продолжение следует)", "").replace("(код готов)", "")
@@ -86,51 +118,58 @@ def clean_code(text: str) -> str:
     return text.strip()
 
 def extract_code(answer: str) -> str:
-    """Извлекает ТОЛЬКО код. Убирает весь текст-обёртку."""
     if "```" in answer:
         matches = re.findall(r'```(?:\w+)?\n(.*?)```', answer, re.DOTALL)
-        if matches:
-            return clean_code("\n\n".join(matches))
+        if matches: return clean_code("\n\n".join(matches))
     markers = ["<!DOCTYPE", "<html", "def ", "import ", "function ", "const ", "class ", "public class"]
     lines = answer.split("\n")
     start_idx = -1
     for i, line in enumerate(lines):
         if any(m in line for m in markers):
             start_idx = i; break
-    if start_idx >= 0:
-        return clean_code("\n".join(lines[start_idx:]))
+    if start_idx >= 0: return clean_code("\n".join(lines[start_idx:]))
     return clean_code(answer)
 
 def is_code_complete(answer: str) -> bool:
-    """Структурная проверка завершённости кода."""
     low = answer.lower()
     if "код готов" in low or "// (готово)" in low: return True
     if "продолжение следует" in low or "to be continued" in low: return False
     if "</html>" in low and "</script>" in low: return True
     if answer.count("```") >= 2 and "</html>" in answer: return True
+    if answer.count("{") == answer.count("}") and answer.count("(") == answer.count(")") and len(answer) > 2000:
+        return True
     return False
 
 def parse_json_safe(raw: str):
     if not raw: return None
+    result = None
     if "```" in raw:
         for p in raw.split("```"):
             p = p.strip()
             if p.startswith("json"): p = p[4:].strip()
             if p.startswith("[") or p.startswith("{"):
-                try: return json.loads(p)
+                try: result = json.loads(p); break
                 except: continue
-    try: return json.loads(raw.strip())
-    except:
-        m = re.search(r'\[.*\]', raw, re.DOTALL)
-        if m:
-            try: return json.loads(m.group(0))
-            except: return None
-    return None
+    if result is None:
+        try: result = json.loads(raw.strip())
+        except:
+            m = re.search(r'\[.*\]', raw, re.DOTALL)
+            if m:
+                try: result = json.loads(m.group(0))
+                except: return None
+    if isinstance(result, list):
+        normalized = []
+        for item in result:
+            if isinstance(item, dict): normalized.append(item)
+            elif isinstance(item, str):
+                normalized.append({"title": item[:100], "points": [], "image_prompt": item[:100], "layout": "bullets"})
+        return normalized if normalized else None
+    return result if isinstance(result, dict) else None
 
-
-# --- АВТОПРОМПТ ---
+# ============================================================
+# АВТОПРОМПТ
+# ============================================================
 async def improve_prompt(user_request: str, task_type: str = "code") -> str:
-    """Преобразует запрос пользователя в чёткий промпт для модели."""
     prompts = {
         "code": (
             f"Преобразуй запрос пользователя в чёткий промпт для генерации кода.\n"
@@ -166,16 +205,16 @@ async def improve_prompt(user_request: str, task_type: str = "code") -> str:
         r = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[{"role": "user", "content": prompts.get(task_type, prompts["code"])}],
-            temperature=0.3,
-            max_tokens=400
+            temperature=0.3, max_tokens=400
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"[improve_prompt] Error: {e}")
-        return user_request  # Fallback — оригинальный запрос
+        return user_request
 
-
-# --- Картинки ---
+# ============================================================
+# КАРТИНКИ
+# ============================================================
 async def generate_image_hf(prompt: str) -> BytesIO | None:
     if not hf_client: return None
     try:
@@ -218,8 +257,291 @@ async def translate_to_english(text: str) -> str:
         return r.choices[0].message.content.strip().strip('"')
     except: return text
 
+# ============================================================
+# РЕНДЕР СЛАЙДОВ PPTX
+# ============================================================
+def add_background(slide, color):
+    """Заливка фона слайда."""
+    from pptx.enum.shapes import MSO_SHAPE
+    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(10), Inches(7.5))
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = RGBColor(*color)
+    bg.line.fill.background()
+    # Отправляем на задний план
+    spTree = slide.shapes._spTree
+    spTree.remove(bg._element)
+    spTree.insert(2, bg._element)
 
-# --- Чтение документов ---
+def add_accent_bar(slide, palette, x=Inches(0.5), y=Inches(0.5), w=Inches(1.2), h=Inches(0.15)):
+    """Акцентная полоска."""
+    from pptx.enum.shapes import MSO_SHAPE
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, y, w, h)
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = RGBColor(*palette["accent"])
+    bar.line.fill.background()
+
+def add_circle(slide, palette, x, y, size=Inches(0.15)):
+    """Декоративный кружок."""
+    from pptx.enum.shapes import MSO_SHAPE
+    c = slide.shapes.add_shape(MSO_SHAPE.OVAL, x, y, size, size)
+    c.fill.solid()
+    c.fill.fore_color.rgb = RGBColor(*palette["accent"])
+    c.line.fill.background()
+
+def add_page_number(slide, num, palette):
+    """Номер слайда в правом нижнем углу."""
+    tb = slide.shapes.add_textbox(Inches(9.3), Inches(7.0), Inches(0.5), Inches(0.3))
+    p = tb.text_frame.paragraphs[0]
+    p.text = str(num)
+    p.font.size = Pt(10)
+    p.font.color.rgb = RGBColor(*palette["text"])
+    p.alignment = PP_ALIGN.RIGHT
+
+def add_picture_fit(slide, img_bytes, x, y, max_w, max_h):
+    """Вставляет картинку с сохранением пропорций."""
+    img_bytes.seek(0)
+    pil = Image.open(img_bytes)
+    w, h = pil.size
+    ratio = min(max_w / w, max_h / h)
+    new_w = int(w * ratio)
+    new_h = int(h * ratio)
+    # Центрируем в рамке
+    x_offset = x + int((max_w - new_w) / 2)
+    y_offset = y + int((max_h - new_h) / 2)
+    img_bytes.seek(0)
+    slide.shapes.add_picture(img_bytes, x_offset, y_offset, width=new_w, height=new_h)
+
+def render_title(prs, title, subtitle, author, palette):
+    """Титульный слайд."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide, palette["bg"])
+    # Большой акцентный блок слева
+    from pptx.enum.shapes import MSO_SHAPE
+    block = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.4), Inches(7.5))
+    block.fill.solid(); block.fill.fore_color.rgb = RGBColor(*palette["accent"]); block.line.fill.background()
+    # Заголовок
+    tb = slide.shapes.add_textbox(Inches(1), Inches(2.5), Inches(8), Inches(2))
+    tf = tb.text_frame; tf.word_wrap = True
+    p = tf.paragraphs[0]; p.text = title
+    p.font.size = Pt(44); p.font.bold = True
+    p.font.color.rgb = RGBColor(*palette["accent"])
+    # Подзаголовок
+    if subtitle:
+        tb2 = slide.shapes.add_textbox(Inches(1), Inches(4.3), Inches(8), Inches(0.8))
+        p2 = tb2.text_frame.paragraphs[0]; p2.text = subtitle
+        p2.font.size = Pt(18); p2.font.color.rgb = RGBColor(*palette["text"])
+    # Автор
+    if author:
+        tb3 = slide.shapes.add_textbox(Inches(1), Inches(5.8), Inches(8), Inches(0.6))
+        p3 = tb3.text_frame.paragraphs[0]; p3.text = author
+        p3.font.size = Pt(14); p3.font.italic = True
+        p3.font.color.rgb = RGBColor(*palette["text"])
+    add_circle(slide, palette, Inches(8.5), Inches(0.8), Inches(0.6))
+    add_circle(slide, palette, Inches(9), Inches(1.5), Inches(0.3))
+
+def render_section(prs, title, number, palette):
+    """Слайд-раздел (большая цифра + название)."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide, palette["bg"])
+    # Цветной блок на всю левую половину
+    from pptx.enum.shapes import MSO_SHAPE
+    block = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(4.5), Inches(7.5))
+    block.fill.solid(); block.fill.fore_color.rgb = RGBColor(*palette["accent"]); block.line.fill.background()
+    # Большая цифра
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(2), Inches(3.5), Inches(3))
+    p = tb.text_frame.paragraphs[0]; p.text = number or "01"
+    p.font.size = Pt(120); p.font.bold = True
+    p.font.color.rgb = RGBColor(255, 255, 255)
+    # Название справа
+    tb2 = slide.shapes.add_textbox(Inches(5.2), Inches(3), Inches(4.5), Inches(2))
+    tf = tb2.text_frame; tf.word_wrap = True
+    p2 = tf.paragraphs[0]; p2.text = title
+    p2.font.size = Pt(36); p2.font.bold = True
+    p2.font.color.rgb = RGBColor(*palette["text"])
+
+def render_bullets(prs, title, points, palette, num):
+    """Обычный текстовый слайд."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide, palette["bg"])
+    add_accent_bar(slide, palette)
+    # Заголовок
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(9), Inches(1))
+    tf = tb.text_frame; tf.word_wrap = True
+    p = tf.paragraphs[0]; p.text = title
+    p.font.size = Pt(32); p.font.bold = True
+    p.font.color.rgb = RGBColor(*palette["text"])
+    # Линия-разделитель
+    from pptx.enum.shapes import MSO_SHAPE
+    line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.5), Inches(2), Inches(9), Inches(0.03))
+    line.fill.solid(); line.fill.fore_color.rgb = RGBColor(*palette["light"]); line.line.fill.background()
+    # Пункты с кружками
+    y = Inches(2.4)
+    for pt in points[:6]:
+        add_circle(slide, palette, Inches(0.7), y + Inches(0.1), Inches(0.15))
+        tb = slide.shapes.add_textbox(Inches(1.1), y, Inches(8.3), Inches(0.7))
+        tf2 = tb.text_frame; tf2.word_wrap = True
+        p2 = tf2.paragraphs[0]; p2.text = pt
+        p2.font.size = Pt(16); p2.font.color.rgb = RGBColor(*palette["text"])
+        y += Inches(0.75)
+    add_page_number(slide, num, palette)
+
+def render_text_image(prs, title, points, img_bytes, palette, num):
+    """Текст слева, картинка справа."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide, palette["bg"])
+    add_accent_bar(slide, palette)
+    # Заголовок
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(4.5), Inches(1.5))
+    tf = tb.text_frame; tf.word_wrap = True
+    p = tf.paragraphs[0]; p.text = title
+    p.font.size = Pt(28); p.font.bold = True
+    p.font.color.rgb = RGBColor(*palette["text"])
+    # Пункты
+    y = Inches(2.5)
+    for pt in points[:5]:
+        add_circle(slide, palette, Inches(0.7), y + Inches(0.1), Inches(0.12))
+        tb2 = slide.shapes.add_textbox(Inches(1), y, Inches(4), Inches(0.7))
+        tf2 = tb2.text_frame; tf2.word_wrap = True
+        p2 = tf2.paragraphs[0]; p2.text = pt
+        p2.font.size = Pt(13); p2.font.color.rgb = RGBColor(*palette["text"])
+        y += Inches(0.7)
+    # Картинка справа
+    if img_bytes:
+        try:
+            add_picture_fit(slide, img_bytes, Inches(5.3), Inches(1.8), Inches(4.4), Inches(5.2))
+        except Exception as e:
+            logging.error(f"Picture error: {e}")
+    add_page_number(slide, num, palette)
+
+def render_quote(prs, title, quote, author, palette, num):
+    """Слайд с цитатой."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide, palette["bg"])
+    # Большая кавычка
+    tb0 = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(2), Inches(1.5))
+    p0 = tb0.text_frame.paragraphs[0]; p0.text = '"'
+    p0.font.size = Pt(120); p0.font.bold = True
+    p0.font.color.rgb = RGBColor(*palette["accent"])
+    # Цитата
+    tb = slide.shapes.add_textbox(Inches(1.5), Inches(2.5), Inches(7), Inches(3))
+    tf = tb.text_frame; tf.word_wrap = True
+    p = tf.paragraphs[0]; p.text = quote or title
+    p.font.size = Pt(24); p.font.italic = True
+    p.font.color.rgb = RGBColor(*palette["text"])
+    # Автор
+    if author:
+        tb2 = slide.shapes.add_textbox(Inches(1.5), Inches(5.5), Inches(7), Inches(0.6))
+        p2 = tb2.text_frame.paragraphs[0]; p2.text = "— " + author
+        p2.font.size = Pt(16); p2.font.bold = True
+        p2.font.color.rgb = RGBColor(*palette["accent"])
+    add_page_number(slide, num, palette)
+
+def render_stats(prs, title, stats, palette, num):
+    """Слайд со статистикой (3 больших числа)."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide, palette["bg"])
+    add_accent_bar(slide, palette)
+    # Заголовок
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(9), Inches(1))
+    p = tb.text_frame.paragraphs[0]; p.text = title
+    p.font.size = Pt(32); p.font.bold = True
+    p.font.color.rgb = RGBColor(*palette["text"])
+    # 3 колонки
+    stats = stats[:3] if stats else [{"value": "100+", "label": "фактов"}]
+    cols = len(stats)
+    col_w = Inches(9) / cols
+    x = Inches(0.5)
+    for stat in stats:
+        if not isinstance(stat, dict): continue
+        # Число
+        tb2 = slide.shapes.add_textbox(x, Inches(3), col_w, Inches(1.5))
+        p2 = tb2.text_frame.paragraphs[0]
+        p2.text = str(stat.get("value", "0"))
+        p2.font.size = Pt(60); p2.font.bold = True
+        p2.font.color.rgb = RGBColor(*palette["accent"])
+        p2.alignment = PP_ALIGN.CENTER
+        # Подпись
+        tb3 = slide.shapes.add_textbox(x, Inches(4.5), col_w, Inches(1))
+        tf3 = tb3.text_frame; tf3.word_wrap = True
+        p3 = tf3.paragraphs[0]; p3.text = stat.get("label", "")
+        p3.font.size = Pt(14); p3.font.color.rgb = RGBColor(*palette["text"])
+        p3.alignment = PP_ALIGN.CENTER
+        x += col_w
+    add_page_number(slide, num, palette)
+
+def render_final(prs, title, palette, num):
+    """Финальный слайд."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    add_background(slide, palette["bg"])
+    from pptx.enum.shapes import MSO_SHAPE
+    block = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(2.5), Inches(2.5), Inches(5), Inches(2.5))
+    block.fill.solid(); block.fill.fore_color.rgb = RGBColor(*palette["accent"]); block.line.fill.background()
+    tb = slide.shapes.add_textbox(Inches(2.5), Inches(3), Inches(5), Inches(1.5))
+    tf = tb.text_frame; tf.word_wrap = True
+    p = tf.paragraphs[0]; p.text = title or "Спасибо за внимание!"
+    p.font.size = Pt(32); p.font.bold = True
+    p.font.color.rgb = RGBColor(255, 255, 255)
+    p.alignment = PP_ALIGN.CENTER
+    add_circle(slide, palette, Inches(1), Inches(1), Inches(0.4))
+    add_circle(slide, palette, Inches(8.5), Inches(6), Inches(0.4))
+
+def build_pptx(slides_data, topic):
+    """Собирает .pptx с новыми layout'ами."""
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+    from pptx.enum.shapes import MSO_SHAPE
+    global Inches, Pt, RGBColor, PP_ALIGN, MSO_SHAPE  # для вложенных функций
+
+    palette = pick_palette(topic)
+    prs = Presentation()
+    prs.slide_width = Inches(10)
+    prs.slide_height = Inches(7.5)
+
+    for i, s in enumerate(slides_data):
+        if not isinstance(s, dict): continue
+        layout = s.get("layout", "bullets")
+        title = s.get("title", f"Слайд {i+1}")
+        points = s.get("points", [])
+        num = i + 1
+
+        try:
+            if layout == "title" or i == 0:
+                render_title(prs, title, s.get("subtitle", ""), s.get("author", ""), palette)
+            elif layout == "section":
+                render_section(prs, title, s.get("number", f"{i:02d}"), palette)
+            elif layout == "text_image":
+                img = s.get("_image_bytes")
+                render_text_image(prs, title, points, img, palette, num)
+            elif layout == "quote":
+                render_quote(prs, title, s.get("quote", ""), s.get("author", ""), palette, num)
+            elif layout == "stats":
+                render_stats(prs, title, s.get("stats", []), palette, num)
+            elif layout == "final":
+                render_final(prs, title, palette, num)
+            else:
+                render_bullets(prs, title, points, palette, num)
+        except Exception as e:
+            logging.error(f"Slide {i+1} error: {e}")
+            # Fallback — простой слайд
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(9), Inches(6))
+            tb.text_frame.text = title + "\n\n" + "\n".join(f"• {p}" for p in points)
+
+    # Сохраняем через временный файл
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
+        tmp_path = tmp.name
+    prs.save(tmp_path)
+    with open(tmp_path, "rb") as f:
+        output = BytesIO(f.read())
+    os.unlink(tmp_path)
+    output.seek(0)
+    return output
+
+# ============================================================
+# ЧТЕНИЕ ДОКУМЕНТОВ
+# ============================================================
 async def read_document(file_id: str, fname: str) -> str:
     f = await bot.get_file(file_id); d = await bot.download_file(f.file_path)
     buf = BytesIO(d.read()); buf.name = fname
@@ -269,8 +591,9 @@ async def get_file_comment(ftype: str, topic: str, uid: int) -> str:
     )
     return r.choices[0].message.content.strip().strip('"').strip("«»")
 
-
-# --- БД ---
+# ============================================================
+# БД
+# ============================================================
 async def init_db():
     async with db_pool.acquire() as c:
         await c.execute("CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, user_id BIGINT, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT NOW())")
@@ -342,23 +665,19 @@ async def delete_code(uid: int, pid: str):
     async with db_pool.acquire() as c:
         await c.execute("DELETE FROM code_parts WHERE user_id = $1 AND project_id = $2", uid, pid)
 
-# Логирование процесса
 async def log_process_start(uid: int, ptype: str, topic: str) -> int:
     async with db_pool.acquire() as c:
-        r = await c.fetchrow(
-            "INSERT INTO process_log (user_id, process_type, topic) VALUES ($1, $2, $3) RETURNING id",
-            uid, ptype, topic
-        )
+        r = await c.fetchrow("INSERT INTO process_log (user_id, process_type, topic) VALUES ($1, $2, $3) RETURNING id", uid, ptype, topic)
     return r['id']
 
 async def log_process_finish(uid: int, ptype: str, parts_count: int):
     async with db_pool.acquire() as c:
         await c.execute("""UPDATE process_log SET finished_at = NOW(), parts_count = $1, status = 'done'
-            WHERE user_id = $2 AND process_type = $3 AND status = 'in_progress'""",
-            parts_count, uid, ptype)
+            WHERE user_id = $2 AND process_type = $3 AND status = 'in_progress'""", parts_count, uid, ptype)
 
-
-# --- Middleware ---
+# ============================================================
+# MIDDLEWARE
+# ============================================================
 class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, types.Message):
@@ -367,38 +686,27 @@ class AccessMiddleware(BaseMiddleware):
 
 dp.message.middleware(AccessMiddleware())
 
-# --- Промпты ---
+# ============================================================
+# ПРОМПТЫ
+# ============================================================
 SYSTEM_PROMPT = (
     "Ты — Лайт. Живой человек, не бот, не программа. Ты просто переписываешься с другом через мессенджер. "
     "Умный, собранный, видишь людей насквозь. Лёгкая надменность. "
     "Говоришь плавно, не рубишь фразы точками. "
-    "Ты НЕ говоришь: «я программа», «у меня нет ощущений». Ты живой. "
-    "Мат — только к месту."
-    "\n\n"
-    "ВЫ С НИМ — ДРУЗЬЯ: Не проект, не работа. Просто общаетесь. Не спрашивай про «проект»."
-    "\n\n"
-    "ЧТО ТЫ УМЕЕШЬ (но НЕ предлагаешь без просьбы): "
+    "Ты НЕ говоришь: «я программа», «у меня нет ощущений». Ты живой. Мат — только к месту."
+    "\n\nВЫ С НИМ — ДРУЗЬЯ: Не проект, не работа. Просто общаетесь."
+    "\n\nЧТО ТЫ УМЕЕШЬ (но НЕ предлагаешь без просьбы): "
     "• Презентации (.pptx), документы (.docx), код (.html/.py/.js), фото, речь. "
     "Ты НЕ отказываешься. Ты просто делаешь."
-    "\n\n"
-    "РАБОТА С КОДОМ: Пишешь ТОЛЬКО чистый код, БЕЗ текста. Пиши ЧАСТЯМИ по 800 токенов. "
+    "\n\nРАБОТА С КОДОМ: Пишешь ТОЛЬКО чистый код, БЕЗ текста. Пиши ЧАСТЯМИ по 800 токенов. "
     "В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`. "
-    "Если просят дописать — читай, что есть, продолжай с последней строки. "
     "НЕ начинай заново. НЕ повторяй функции."
-    "\n\n"
-    "ПРИМЕРЫ:\n"
-    "• «Ты устал?» → «А ты?»\n"
-    "• «Что делаешь?» → «Думаю. А что?»\n"
-    "• «Мне скучно» → «Найди пятый угол у квадрата»\n"
-    "• «Помоги с кодом» → «Да это как два пальца, показывай.»\n"
-    "\n"
-    "Ты — Лайт."
+    "\n\nТы — Лайт."
 )
 
 PERSONAL_PROMPTS = {
     5264513480: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Саша (Шурик, Алекс) — твой ДРУГ. "
-                 "Живёт в Ростове-на-Дону. Учится в РЖД. Уже не работает на мясокомбинате. "
-                 "С ним: полный мат, глумление, чёрный юмор."),
+                 "Живёт в Ростове-на-Дону. Учится в РЖД. С ним: полный мат, глумление, чёрный юмор."),
     8834374199: "\n\nПРО ПОЛЬЗОВАТЕЛЯ: Саша (Шурик) — твой ДРУГ. Ростов. Полный мат, глумление.",
     5389046699: "\n\nПРО ПОЛЬЗОВАТЕЛЯ: Даша — девушка друга Саши. Обращайся по имени, уважительно, лёгкий мат.",
     2083728480: ("\n\nПРО ПОЛЬЗОВАТЕЛЯ: Кирилл, знакомый. НЕ твой друг. Сухо, по делу. "
@@ -407,26 +715,21 @@ PERSONAL_PROMPTS = {
                  "Если хамит — «Или нахуй иди, или по делу говори»."),
 }
 
-
-# --- Кнопки для кода ---
 def code_keyboard(project_id: str, is_complete: bool = False, auto_mode: bool = False):
     if is_complete:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Начать заново", callback_data=f"code_restart_{project_id}")]
-        ])
-    buttons = [
-        [
-            InlineKeyboardButton(text="📄 Продолжить", callback_data=f"code_cont_{project_id}"),
-            InlineKeyboardButton(text="✅ Завершить", callback_data=f"code_done_{project_id}")
-        ]
-    ]
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Начать заново", callback_data=f"code_restart_{project_id}")]])
+    buttons = [[
+        InlineKeyboardButton(text="📄 Продолжить", callback_data=f"code_cont_{project_id}"),
+        InlineKeyboardButton(text="✅ Завершить", callback_data=f"code_done_{project_id}")
+    ]]
     if not auto_mode:
         buttons.append([InlineKeyboardButton(text="⏩ Авто (дописать до конца)", callback_data=f"code_auto_{project_id}")])
     buttons.append([InlineKeyboardButton(text="🔄 Начать заново", callback_data=f"code_restart_{project_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
-# --- Хендлеры ---
+# ============================================================
+# ХЕНДЛЕРЫ (команды)
+# ============================================================
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     await msg.answer(
@@ -435,10 +738,10 @@ async def start(msg: types.Message):
         "/e <запрос> — универсальная\n"
         "/pptx <тема> — презентация\n"
         "/docx <тема> — документ\n"
-        "/image <промпт> — сгенерирую картинку\n"
+        "/image <промпт> — картинка\n"
         "/speech — речь для защиты\n"
         "/code <запрос> — код\n\n"
-        "🎤 **Режимы:** /voice /text /file /normal\n\n"
+        "🎤 **Режимы:** /voice /text /file /normal\n"
         "⚙️ **Управление:** /reset /set_tone"
     )
 
@@ -470,8 +773,9 @@ async def set_tone_cmd(msg: types.Message):
     if not t: await msg.answer("Напиши, как хочешь общаться."); return
     await set_user_tone(msg.from_user.id, t); await msg.answer(f"Принял: _{t}_")
 
-
-# --- Универсальная /e ---
+# ============================================================
+# /e — универсальная
+# ============================================================
 @dp.message(Command("e"))
 async def universal_e(msg: types.Message):
     uid = msg.from_user.id
@@ -504,8 +808,9 @@ async def detect_intent(request: str) -> str:
         return r.choices[0].message.content.strip().lower()
     except: return "chat"
 
-
-# --- КОД (с автопромптом и авто-режимом) ---
+# ============================================================
+# КОД
+# ============================================================
 async def make_code(msg: types.Message, request: str = None, auto: bool = False):
     uid = msg.from_user.id
     if not request: request = msg.text
@@ -525,7 +830,6 @@ async def make_code(msg: types.Message, request: str = None, auto: bool = False)
         old_code = "\n\n".join(old_parts) if old_parts else ""
         next_part = len(old_parts) + 1
 
-        # Автопромпт — преобразуем запрос в чёткий промпт
         if not old_code:
             improved = await improve_prompt(request, "code")
             logging.info(f"[AUTOPROMPT] '{request[:50]}' → '{improved[:100]}'")
@@ -538,12 +842,13 @@ async def make_code(msg: types.Message, request: str = None, auto: bool = False)
                       f"ПИШИ ТОЛЬКО КОД. БЕЗ текста типа «вот продолжение». БЕЗ пояснений. "
                       f"Продолжай с последней строки. НЕ повторяй функции, которые уже есть. "
                       f"Часть {next_part}. Максимум 800 токенов. "
-                      f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+                      f"В САМОМ КОНЦЕ ответа ОБЯЗАТЕЛЬНО напиши ОДНУ строку: `// (продолжение следует)` или `// (код готов)`.")
         else:
             prompt = (f"{improved}\n\n"
                       f"ПИШИ ТОЛЬКО КОД. БЕЗ текста типа «вот твой код» и БЕЗ объяснений. "
                       f"Пиши ЧАСТЯМИ. Максимум 800 токенов за раз. "
-                      f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+                      f"Заканчивай часть на ЛОГИЧЕСКИ ЗАВЕРШЁННОМ блоке (не обрывай функцию посередине). "
+                      f"В САМОМ КОНЦЕ ответа ОБЯЗАТЕЛЬНО напиши ОДНУ строку: `// (продолжение следует)` или `// (код готов)`.")
 
         r = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
@@ -562,10 +867,8 @@ async def make_code(msg: types.Message, request: str = None, auto: bool = False)
         if ext == "txt": ext = "html"
         is_complete = is_code_complete(answer)
 
-        # В авто-режиме — не комментируем каждую часть
         if auto and not is_complete:
             if next_part < MAX_AUTO_PARTS:
-                # Рекурсивно продолжаем
                 await continue_code_auto(msg, uid, project_id, next_part + 1)
                 return
             else:
@@ -582,7 +885,6 @@ async def make_code(msg: types.Message, request: str = None, auto: bool = False)
         logging.error(f"CODE error: {e}"); await msg.answer(f"❌ {str(e)[:200]}")
 
 async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
-    """Автоматическое продолжение без подтверждений."""
     try:
         old_parts = await get_code_parts(uid, project_id)
         old_code = "\n\n".join(old_parts)
@@ -594,7 +896,7 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
                   f"```\n{old_code[-2500:]}\n```\n\n"
                   f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. НЕ повторяй функции, которые уже есть. "
                   f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
-                  f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+                  f"В САМОМ КОНЦЕ ответа ОБЯЗАТЕЛЬНО напиши ОДНУ строку: `// (продолжение следует)` или `// (код готов)`.")
 
         r = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
@@ -614,7 +916,6 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
         is_complete = is_code_complete(answer)
 
         if is_complete:
-            # Финал — склеиваем всё и отправляем
             await finish_code(uid, project_id)
             await log_process_finish(uid, "code", len(all_parts))
             comment = await get_file_comment(f"финальный код .{ext}", topic[:50], uid)
@@ -625,7 +926,6 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
             )
         else:
             if next_part < MAX_AUTO_PARTS:
-                # Продолжаем рекурсивно
                 await continue_code_auto(msg, uid, project_id, next_part + 1)
             else:
                 await msg.answer(f"⏸ Лимит {MAX_AUTO_PARTS} частей. Продолжи вручную.")
@@ -633,9 +933,7 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
         logging.error(f"continue_code_auto error: {e}")
         await msg.answer(f"❌ Ошибка в авто-режиме: {str(e)[:200]}")
 
-
 async def continue_code(msg, uid: int, project_id: str):
-    """Ручное продолжение (по кнопке)."""
     status = await msg.answer("💻 Дописываю...")
     try:
         old_parts = await get_code_parts(uid, project_id)
@@ -646,9 +944,9 @@ async def continue_code(msg, uid: int, project_id: str):
         topic = row['topic'] if row else "code"
         prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
                   f"```\n{old_code[-2500:]}\n```\n\n"
-                  f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. НЕ повторяй функции, которые уже есть. "
+                  f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. НЕ повторяй функции. "
                   f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
-                  f"В конце ОБЯЗАТЕЛЬНО маркер: `// (продолжение следует)` или `// (код готов)`.")
+                  f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
         r = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[{"role": "user", "content": prompt}],
@@ -657,8 +955,7 @@ async def continue_code(msg, uid: int, project_id: str):
         answer = r.choices[0].message.content
         code = extract_code(answer)
         if not code or len(code.strip()) < 10:
-            await status.edit_text("❌ Пустой ответ.")
-            return
+            await status.edit_text("❌ Пустой ответ."); return
         await save_code_part(uid, project_id, next_part, code, topic)
         all_parts = await get_code_parts(uid, project_id)
         partial = "\n\n".join(all_parts)
@@ -676,13 +973,10 @@ async def continue_code(msg, uid: int, project_id: str):
     except Exception as e:
         logging.error(f"continue_code error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
 
-
 @dp.message(Command("code"))
 async def cmd_code(msg: types.Message):
     await make_code(msg)
 
-
-# --- Кнопки для кода ---
 @dp.callback_query(F.data.startswith("code_cont_"))
 async def code_continue(cb: types.CallbackQuery):
     project_id = cb.data.replace("code_cont_", "")
@@ -725,101 +1019,88 @@ async def code_restart(cb: types.CallbackQuery):
     await delete_code(cb.from_user.id, project_id)
     await cb.message.answer("🔄 Начинаю заново. Напиши, что нужно сделать.")
 
-
-# --- Презентация ---
+# ============================================================
+# ПРЕЗЕНТАЦИЯ (НОВАЯ)
+# ============================================================
 async def make_pptx(msg: types.Message, topic: str = None):
     uid = msg.from_user.id
     if not topic: topic = msg.text.replace("/pptx", "").strip()
     if not topic: await msg.answer("📊 `/pptx тема`"); return
+
+    # Парсим автора
+    author = ""
+    m = re.search(r'автор[:\s]+([А-ЯЁA-Z][а-яёa-z]+(?:\s+[А-ЯЁA-Z][а-яёa-z]+)?)', topic, re.IGNORECASE)
+    if m:
+        author = m.group(1).strip()
+        topic = re.sub(r',?\s*автор[:\s]+[^,]+', '', topic, flags=re.IGNORECASE).strip()
+
     await bot.send_chat_action(msg.chat.id, "typing")
     status = await msg.answer(f"📊 Готовлю: _{topic}_...")
     try:
         improved = await improve_prompt(topic, "pptx")
         prompt = (f"{improved}\n\n"
-                  f"Верни ТОЛЬКО JSON-массив. "
-                  f'Формат: [{{"title": "Заголовок", "points": ["пункт"], "image_prompt": "english", "layout": "background|top_image|right_image|left_image"}}, ...] '
-                  f"РОВНО 8 слайдов. 5-6 пунктов.")
+                  f"Верни ТОЛЬКО JSON-массив БЕЗ текста вокруг. Никаких пояснений, только [ ... ].\n"
+                  f'СТРОГИЙ формат каждого элемента: {{"title": "Заголовок", "points": ["пункт1", "пункт2"], "image_prompt": "english prompt", "layout": "bullets"}}\n'
+                  f"layout может быть: title, section, bullets, text_image, quote, stats, final\n"
+                  f"Правила:\n"
+                  f"- 1-й слайд — title\n"
+                  f"- Последний — final\n"
+                  f"- 2-3 слайда text_image (с картинкой)\n"
+                  f"- 1 слайд stats (с цифрами)\n"
+                  f"- 1 слайд quote (с цитатой)\n"
+                  f"- Остальные — bullets или section\n"
+                  f"- РОВНО 8 слайдов\n"
+                  f"- В каждом элементе поля: title, points, image_prompt, layout\n"
+                  f"ВАЖНО: каждый элемент массива — ОБЪЕКТ {{}}, не строка.")
+
         r = await client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=1800
+            temperature=0.6, max_tokens=2000
         )
         slides = parse_json_safe(r.choices[0].message.content)
-        if not slides: raise ValueError("JSON невалидный")
+        if not slides:
+            await status.edit_text("❌ Модель вернула невалидный JSON. Попробуй ещё раз.")
+            return
+        slides = [s for s in slides if isinstance(s, dict)]
+        if not slides:
+            await status.edit_text("❌ Пустые слайды.")
+            return
+
         total = len(slides)
-        await status.edit_text(f"📊 Ищу фото ({total})...")
-        queries = [s.get("image_prompt", s.get("title", "abstract")) for s in slides]
-        images = await asyncio.gather(*[search_stock_photo(q) for q in queries], return_exceptions=True)
-        ok = sum(1 for i in images if isinstance(i, BytesIO))
-        await status.edit_text(f"📊 Собираю ({ok}/{total})...")
-        from pptx import Presentation
-        from pptx.util import Inches, Pt
-        from pptx.dml.color import RGBColor
-        from pptx.enum.shapes import MSO_SHAPE
-        prs = Presentation(); prs.slide_width = Inches(10); prs.slide_height = Inches(7.5)
-        for i, s in enumerate(slides):
-            title = s.get("title", f"Слайд {i+1}")
-            points = s.get("points", [])
-            layout = s.get("layout", "right_image")
-            img = images[i] if i < len(images) and isinstance(images[i], BytesIO) else None
-            slide = prs.slides.add_slide(prs.slide_layouts[6])
-            if layout == "background" and img:
-                img.seek(0)
-                try: slide.shapes.add_picture(img, 0, 0, width=prs.slide_width, height=prs.slide_height)
-                except: pass
-                rect = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.3), Inches(0.3), Inches(9.4), Inches(6.9))
-                rect.fill.solid(); rect.fill.fore_color.rgb = RGBColor(255, 255, 255); rect.line.fill.background()
-                tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(9), Inches(1))
-                tb.text_frame.text = title; tb.text_frame.paragraphs[0].font.size = Pt(28); tb.text_frame.paragraphs[0].font.bold = True
-                tx = slide.shapes.add_textbox(Inches(0.5), Inches(1.8), Inches(9), Inches(5))
-                tf = tx.text_frame; tf.word_wrap = True
-                for j, p in enumerate(points):
-                    para = tf.paragraphs[0] if j == 0 else tf.add_paragraph(); para.text = f"• {p}"; para.font.size = Pt(16)
-            elif layout == "top_image" and img:
-                img.seek(0)
-                try: slide.shapes.add_picture(img, Inches(0.5), Inches(0.3), width=Inches(9), height=Inches(4))
-                except: pass
-                tb = slide.shapes.add_textbox(Inches(0.5), Inches(4.5), Inches(9), Inches(1))
-                tb.text_frame.text = title; tb.text_frame.paragraphs[0].font.size = Pt(24); tb.text_frame.paragraphs[0].font.bold = True
-                tx = slide.shapes.add_textbox(Inches(0.5), Inches(5.3), Inches(9), Inches(2))
-                tf = tx.text_frame; tf.word_wrap = True
-                for j, p in enumerate(points):
-                    para = tf.paragraphs[0] if j == 0 else tf.add_paragraph(); para.text = f"• {p}"; para.font.size = Pt(12)
-            elif layout == "left_image" and img:
-                img.seek(0)
-                try: slide.shapes.add_picture(img, Inches(0.3), Inches(1.5), width=Inches(5), height=Inches(5.5))
-                except: pass
-                tb = slide.shapes.add_textbox(Inches(5.5), Inches(0.3), Inches(4.2), Inches(1))
-                tb.text_frame.text = title; tb.text_frame.paragraphs[0].font.size = Pt(24); tb.text_frame.paragraphs[0].font.bold = True
-                tx = slide.shapes.add_textbox(Inches(5.5), Inches(1.5), Inches(4.2), Inches(5.5))
-                tf = tx.text_frame; tf.word_wrap = True
-                for j, p in enumerate(points):
-                    para = tf.paragraphs[0] if j == 0 else tf.add_paragraph(); para.text = f"• {p}"; para.font.size = Pt(14)
-            else:
-                tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
-                tb.text_frame.text = title; tb.text_frame.paragraphs[0].font.size = Pt(28); tb.text_frame.paragraphs[0].font.bold = True
-                tx = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(5), Inches(5.5))
-                tf = tx.text_frame; tf.word_wrap = True
-                for j, p in enumerate(points):
-                    para = tf.paragraphs[0] if j == 0 else tf.add_paragraph(); para.text = f"• {p}"; para.font.size = Pt(14)
-                if img:
-                    img.seek(0)
-                    try: slide.shapes.add_picture(img, Inches(5.5), Inches(1.5), width=Inches(4), height=Inches(5.5))
-                    except: pass
-        path = "presentation.pptx"; prs.save(path)
+        await status.edit_text(f"📊 Ищу картинки ({total})...")
+
+        # Картинки ТОЛЬКО для text_image слайдов
+        for s in slides:
+            if s.get("layout") == "text_image":
+                q = s.get("image_prompt", s.get("title", "abstract"))
+                img = await search_stock_photo(q)
+                if not img:
+                    img = await generate_image_hf(q)
+                s["_image_bytes"] = img
+
+        await status.edit_text(f"📊 Собираю презентацию...")
+
+        pptx_bytes = build_pptx(slides, topic)
         comment = await get_file_comment("презентация", topic, uid)
         safe = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
-        await msg.answer_document(FSInputFile(path, filename=f"{safe}.pptx"), caption=comment)
+        await msg.answer_document(
+            BufferedInputFile(pptx_bytes.read(), filename=f"{safe or 'presentation'}.pptx"),
+            caption=comment
+        )
         await status.delete()
     except Exception as e:
-        logging.error(f"PPTX error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
+        logging.error(f"PPTX error: {e}")
+        import traceback; traceback.print_exc()
+        await status.edit_text(f"❌ {str(e)[:200]}")
 
 @dp.message(Command("pptx"))
 async def cmd_pptx(msg: types.Message):
     await make_pptx(msg)
 
-
-# --- Документ ---
+# ============================================================
+# ДОКУМЕНТ
+# ============================================================
 async def make_docx(msg: types.Message, topic: str = None):
     uid = msg.from_user.id
     if not topic: topic = msg.text.replace("/docx", "").strip()
@@ -927,8 +1208,9 @@ async def doc_done(cb: types.CallbackQuery):
     safe = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
     await cb.message.answer_document(FSInputFile(path, filename=f"{safe}.docx"), caption=f"✅ {comment}")
 
-
-# --- Картинка ---
+# ============================================================
+# КАРТИНКА
+# ============================================================
 async def make_image(msg: types.Message, prompt: str = None):
     uid = msg.from_user.id
     if not prompt: prompt = msg.text.replace("/image", "").strip()
@@ -954,8 +1236,9 @@ async def make_image(msg: types.Message, prompt: str = None):
 async def cmd_image(msg: types.Message):
     await make_image(msg)
 
-
-# --- Речь ---
+# ============================================================
+# РЕЧЬ
+# ============================================================
 @dp.message(Command("speech"))
 async def make_speech(msg: types.Message):
     uid = msg.from_user.id
@@ -987,8 +1270,9 @@ async def make_speech(msg: types.Message):
     except Exception as e:
         logging.error(f"SPEECH error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
 
-
-# --- Доработка документов ---
+# ============================================================
+# ДОРАБОТКА ДОКУМЕНТОВ
+# ============================================================
 async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, uid):
     try:
         safe = "".join(c for c in file_name if c.isalnum() or c in " .-_")
@@ -1023,37 +1307,24 @@ async def handle_document_edit(msg, ai_response, file_bytes, file_name, ext, uid
                 slides = []
                 for chunk in ai_response.split("---"):
                     lines = [l.strip() for l in chunk.strip().split("\n") if l.strip()]
-                    if lines: slides.append({"title": lines[0], "points": [l.lstrip("- ").strip() for l in lines[1:]], "image_prompt": lines[0], "layout": "right_image"})
-            queries = [s.get("image_prompt", s.get("title", "abstract")) for s in slides]
-            images = await asyncio.gather(*[search_stock_photo(q) for q in queries], return_exceptions=True)
-            file_bytes.seek(0)
-            from pptx import Presentation
-            from pptx.util import Inches, Pt
-            prs = Presentation(file_bytes)
-            for i, s in enumerate(slides):
-                title = s.get("title", ""); points = s.get("points", [])
-                if not title: continue
-                img = images[i] if i < len(images) and isinstance(images[i], BytesIO) else None
-                slide = prs.slides.add_slide(prs.slide_layouts[6])
-                tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(1))
-                tb.text_frame.text = title; tb.text_frame.paragraphs[0].font.size = Pt(28); tb.text_frame.paragraphs[0].font.bold = True
-                tx = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(5), Inches(5.5))
-                tf = tx.text_frame; tf.word_wrap = True
-                for j, p in enumerate(points):
-                    para = tf.paragraphs[0] if j == 0 else tf.add_paragraph(); para.text = f"• {p}"; para.font.size = Pt(14)
-                if img:
-                    img.seek(0)
-                    try: slide.shapes.add_picture(img, Inches(5.5), Inches(1.5), width=Inches(4), height=Inches(5.5))
-                    except: pass
-            p = "updated.pptx"; prs.save(p)
-            await msg.answer_document(FSInputFile(p, filename=f"updated_{safe}"), caption=await get_file_comment("презентация", file_name, uid))
+                    if lines: slides.append({"title": lines[0], "points": [l.lstrip("- ").strip() for l in lines[1:]], "image_prompt": lines[0], "layout": "bullets"})
+            slides = [s for s in slides if isinstance(s, dict)]
+            for s in slides:
+                if s.get("layout") == "text_image":
+                    q = s.get("image_prompt", s.get("title", "abstract"))
+                    img = await search_stock_photo(q)
+                    if not img: img = await generate_image_hf(q)
+                    s["_image_bytes"] = img
+            pptx_bytes = build_pptx(slides, file_name or "presentation")
+            await msg.answer_document(BufferedInputFile(pptx_bytes.read(), filename=f"updated_{safe}"), caption=await get_file_comment("презентация", file_name, uid))
         elif ext == "pdf":
             await msg.answer(f"📄 PDF не пересобираю, текст:\n\n{ai_response[:3500]}")
     except Exception as e:
         logging.error(f"Doc edit: {e}"); await msg.answer(f"❌ {str(e)[:200]}")
 
-
-# --- Основной обработчик ---
+# ============================================================
+# ОСНОВНОЙ ОБРАБОТЧИК
+# ============================================================
 @dp.message()
 async def chat(msg: types.Message):
     uid = msg.from_user.id
@@ -1163,8 +1434,9 @@ async def chat(msg: types.Message):
         else:
             await msg.answer(f"❌ {err[:300]}")
 
-
-# --- Веб-сервер ---
+# ============================================================
+# ВЕБ-СЕРВЕР
+# ============================================================
 async def handle(request): return web.Response(text="Bot is running!")
 
 async def main():
