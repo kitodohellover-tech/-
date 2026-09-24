@@ -51,6 +51,28 @@ CODE_EXTENSIONS = ["html", "py", "js", "css", "java", "cpp", "sql", "json"]
 MAX_AUTO_PARTS = 10
 
 # ============================================================
+# RETRY-ОБЁРТКА ДЛЯ GROQ (фикс 429)
+# ============================================================
+async def call_groq_with_retry(messages, max_retries=3, max_tokens=1200, temperature=0.7, model="qwen/qwen3.8-27b"):
+    """Вызов Groq с retry при 429 (Too Many Requests)."""
+    for attempt in range(max_retries):
+        try:
+            return await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+        except Exception as e:
+            err = str(e)
+            if "429" in err and attempt < max_retries - 1:
+                wait = 15 * (attempt + 1)  # 15, 30, 45 сек
+                logging.warning(f"[429] Жду {wait} сек (попытка {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait)
+            else:
+                raise
+
+# ============================================================
 # ПАЛИТРЫ
 # ============================================================
 PALETTES = {
@@ -182,10 +204,9 @@ async def improve_prompt(user_request: str, task_type: str = "code") -> str:
         "docx": f"Преобразуй запрос в промпт для документа. Запрос: {user_request}. Верни ТОЛЬКО промпт.",
     }
     try:
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[{"role": "user", "content": prompts.get(task_type, prompts["code"])}],
-            temperature=0.3, max_tokens=400
+            max_tokens=400, temperature=0.3
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
@@ -228,17 +249,16 @@ async def search_stock_photo(query: str) -> BytesIO | None:
 
 async def translate_to_english(text: str) -> str:
     try:
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[{"role": "system", "content": "Переведи на английский. Только перевод."},
                       {"role": "user", "content": text}],
-            temperature=0.3, max_tokens=150
+            max_tokens=150, temperature=0.3
         )
         return r.choices[0].message.content.strip().strip('"')
     except: return text
 
 # ============================================================
-# РЕНДЕР СЛАЙДОВ (все Inches/Pt/RGBColor — глобальные!)
+# РЕНДЕР СЛАЙДОВ
 # ============================================================
 def add_background(slide, color):
     bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(10), Inches(7.5))
@@ -513,12 +533,14 @@ async def text_to_voice(text: str) -> str:
 async def get_file_comment(ftype: str, topic: str, uid: int) -> str:
     p = PERSONAL_PROMPTS.get(uid, "")
     prompt = f"Ты — Лайт. Сгенерировал {ftype} на тему «{topic}». ОДНО короткое предложение с иронией. Без кавычек."
-    r = await client.chat.completions.create(
-        model="qwen/qwen3.8-27b",
-        messages=[{"role": "system", "content": SYSTEM_PROMPT + p}, {"role": "user", "content": prompt}],
-        temperature=0.9, max_tokens=80
-    )
-    return r.choices[0].message.content.strip().strip('"').strip("«»")
+    try:
+        r = await call_groq_with_retry(
+            messages=[{"role": "system", "content": SYSTEM_PROMPT + p}, {"role": "user", "content": prompt}],
+            max_tokens=80, temperature=0.9
+        )
+        return r.choices[0].message.content.strip().strip('"').strip("«»")
+    except:
+        return f"Готово: {ftype}"
 
 # ============================================================
 # БД
@@ -725,16 +747,15 @@ async def detect_intent(request: str) -> str:
     if any(w in low for w in ["речь", "защит", "выступлен"]): return "speech"
     if any(w in low for w in ["картинк", "фото", "изображен", "нарису"]): return "image"
     try:
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[{"role": "system", "content": "Определи что хочет пользователь. Ответь ОДНИМ словом: pptx, docx, code, image, speech, chat"},
                       {"role": "user", "content": request}],
-            temperature=0.1, max_tokens=10
+            max_tokens=10, temperature=0.1
         )
         return r.choices[0].message.content.strip().lower()
     except: return "chat"
 
-# === ПРЕЗЕНТАЦИЯ (НОВАЯ, с жёсткими layout'ами) ===
+# === ПРЕЗЕНТАЦИЯ ===
 async def make_pptx(msg: types.Message, topic: str = None):
     uid = msg.from_user.id
     if not topic: topic = msg.text.replace("/pptx", "").strip()
@@ -770,10 +791,9 @@ async def make_pptx(msg: types.Message, topic: str = None):
                   f"РОВНО 8 слайдов. В каждом 5-6 пунктов в points. "
                   f"Каждый элемент массива — ОБЪЕКТ {{}}, не строка.")
 
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.6, max_tokens=2500
+            max_tokens=1800, temperature=0.6
         )
         slides = parse_json_safe(r.choices[0].message.content)
         if not slides:
@@ -784,9 +804,7 @@ async def make_pptx(msg: types.Message, topic: str = None):
             await status.edit_text("❌ Пустые слайды.")
             return
 
-        total = len(slides)
         await status.edit_text(f"📊 Ищу картинки...")
-
         for s in slides:
             if s.get("layout") == "text_image":
                 q = s.get("image_prompt", s.get("title", "abstract"))
@@ -795,12 +813,10 @@ async def make_pptx(msg: types.Message, topic: str = None):
                     img = await generate_image_hf(q)
                 s["_image_bytes"] = img
 
-        # Автор в титул
         if author and slides:
             slides[0]["author"] = author
 
         await status.edit_text(f"📊 Собираю презентацию...")
-
         pptx_bytes = build_pptx(slides, topic)
         comment = await get_file_comment("презентация", topic, uid)
         safe = "".join(c for c in topic if c.isalnum() or c in " -_")[:40]
@@ -827,21 +843,13 @@ async def make_docx(msg: types.Message, topic: str = None):
     status = await msg.answer(f"📄 Готовлю: _{topic}_...")
     try:
         plan_prompt = f"План документа на тему «{topic}». 8-10 разделов. ТОЛЬКО нумерованный список."
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": plan_prompt}],
-            temperature=0.5, max_tokens=500
-        )
+        r = await call_groq_with_retry(messages=[{"role": "user", "content": plan_prompt}], max_tokens=500, temperature=0.5)
         plan = r.choices[0].message.content
         doc_id = f"{uid}_{int(datetime.now().timestamp())}"
         first_prompt = (f"Документ на тему «{topic}». План:\n{plan}\n\n"
                         f"Напиши ВВЕДЕНИЕ + первый раздел. Максимум 800 токенов. "
                         f"В конце: `(продолжение следует)`")
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": first_prompt}],
-            temperature=0.7, max_tokens=1000
-        )
+        r = await call_groq_with_retry(messages=[{"role": "user", "content": first_prompt}], max_tokens=1000, temperature=0.7)
         part_text = r.choices[0].message.content
         async with db_pool.acquire() as c:
             await c.execute("INSERT INTO long_docs (user_id, doc_id, part_num, content, doc_type, topic) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -882,11 +890,7 @@ async def doc_continue(cb: types.CallbackQuery):
         prompt = (f"Документ на тему «{topic}». Уже написано (последняя часть):\n{last[-2000:]}\n\n"
                   f"Напиши следующую часть — 1-2 раздела. Максимум 800 токенов. "
                   f"Если это конец — `(конец документа)`. Иначе — `(продолжение следует)`.")
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7, max_tokens=1000
-        )
+        r = await call_groq_with_retry(messages=[{"role": "user", "content": prompt}], max_tokens=1000, temperature=0.7)
         part_text = r.choices[0].message.content
         async with db_pool.acquire() as c:
             await c.execute("INSERT INTO long_docs (user_id, doc_id, part_num, content, doc_type, topic) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -952,23 +956,20 @@ async def make_code(msg: types.Message, request: str = None, auto: bool = False)
             improved = None
 
         if old_code:
-            prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
-                      f"```\n{old_code[-2500:]}\n```\n\n"
-                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста. "
-                      f"Продолжай с последней строки. НЕ повторяй функции. "
+            prompt = (f"Продолжи код. Уже написано (последние строки):\n\n```\n{old_code[-2500:]}\n```\n\n"
+                      f"ПИШИ ТОЛЬКО КОД. НЕ начинай заново. НЕ повторяй. "
                       f"Часть {next_part}. Максимум 800 токенов. "
-                      f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
+                      f"В конце маркер: `// (продолжение следует)` или `// (код готов)`.")
         else:
             prompt = (f"{improved}\n\n"
-                      f"ПИШИ ТОЛЬКО КОД. БЕЗ текста и объяснений. "
-                      f"Пиши ЧАСТЯМИ. Максимум 800 токенов за раз. "
-                      f"Заканчивай часть на ЛОГИЧЕСКИ ЗАВЕРШЁННОМ блоке. "
-                      f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
+                      f"ПИШИ ТОЛЬКО КОД. НЕ разрывай строки на середине. "
+                      f"Максимум 800 токенов. "
+                      f"В конце маркер: `// (продолжение следует)` или `// (код готов)`.")
 
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=1200
+        r = await call_groq_with_retry(
+            messages=[{"role": "system", "content": "Ты — код-ассистент. Пишешь ТОЛЬКО код."},
+                      {"role": "user", "content": prompt}],
+            max_tokens=1200, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -995,10 +996,15 @@ async def make_code(msg: types.Message, request: str = None, auto: bool = False)
             caption=f"{comment}\n\n📄 Часть {next_part}",
             reply_markup=kb
         )
+        if not auto and status:
+            try: await status.delete()
+            except: pass
     except Exception as e:
         logging.error(f"CODE error: {e}"); await msg.answer(f"❌ {str(e)[:200]}")
 
 async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
+    if next_part > 1:
+        await asyncio.sleep(10)
     try:
         old_parts = await get_code_parts(uid, project_id)
         old_code = "\n\n".join(old_parts)
@@ -1006,16 +1012,14 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
             row = await c.fetchrow("SELECT topic FROM code_parts WHERE user_id = $1 AND project_id = $2 LIMIT 1", uid, project_id)
         topic = row['topic'] if row else "code"
 
-        prompt = (f"Продолжи код. Вот что уже написано (последние строки):\n\n"
-                  f"```\n{old_code[-2500:]}\n```\n\n"
-                  f"ПИШИ ТОЛЬКО КОД. НЕ повторяй функции. "
-                  f"Продолжай с последней строки. Часть {next_part}. Максимум 800 токенов. "
-                  f"В САМОМ КОНЦЕ ОБЯЗАТЕЛЬНО: `// (продолжение следует)` или `// (код готов)`.")
+        prompt = (f"Продолжи код:\n```\n{old_code[-2500:]}\n```\n\n"
+                  f"ПИШИ ТОЛЬКО КОД. Часть {next_part}. Максимум 800 токенов. "
+                  f"В САМОМ КОНЦЕ: `// (продолжение следует)` или `// (код готов)`.")
 
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=1200
+        r = await call_groq_with_retry(
+            messages=[{"role": "system", "content": "Ты — код-ассистент. Пишешь ТОЛЬКО код."},
+                      {"role": "user", "content": prompt}],
+            max_tokens=1200, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -1043,7 +1047,7 @@ async def continue_code_auto(msg, uid: int, project_id: str, next_part: int):
             else:
                 await msg.answer(f"⏸ Лимит {MAX_AUTO_PARTS} частей.")
     except Exception as e:
-        logging.error(f"continue_code_auto error: {e}")
+        logging.error(f"auto error: {e}")
         await msg.answer(f"❌ {str(e)[:200]}")
 
 async def continue_code(msg, uid: int, project_id: str):
@@ -1058,10 +1062,10 @@ async def continue_code(msg, uid: int, project_id: str):
         prompt = (f"Продолжи код:\n```\n{old_code[-2500:]}\n```\n\n"
                   f"ПИШИ ТОЛЬКО КОД. Часть {next_part}. Максимум 800 токенов. "
                   f"В САМОМ КОНЦЕ: `// (продолжение следует)` или `// (код готов)`.")
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=1200
+        r = await call_groq_with_retry(
+            messages=[{"role": "system", "content": "Ты — код-ассистент. Пишешь ТОЛЬКО код."},
+                      {"role": "user", "content": prompt}],
+            max_tokens=1200, temperature=0.5
         )
         answer = r.choices[0].message.content
         code = extract_code(answer)
@@ -1082,7 +1086,7 @@ async def continue_code(msg, uid: int, project_id: str):
         )
         await status.delete()
     except Exception as e:
-        logging.error(f"continue_code error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
+        logging.error(f"continue error: {e}"); await status.edit_text(f"❌ {str(e)[:200]}")
 
 @dp.message(Command("code"))
 async def cmd_code(msg: types.Message):
@@ -1118,7 +1122,7 @@ async def code_done(cb: types.CallbackQuery):
 async def code_auto(cb: types.CallbackQuery):
     project_id = cb.data.replace("code_auto_", "")
     await cb.answer("⏩ Авто-режим...")
-    await cb.message.answer("⏩ Авто-режим: дописываю до конца.")
+    await cb.message.answer("⏩ Авто-режим: дописываю до конца. Паузы между частями — 10 сек.")
     old_parts = await get_code_parts(cb.from_user.id, project_id)
     next_part = len(old_parts) + 1
     await continue_code_auto(cb.message, cb.from_user.id, project_id, next_part)
@@ -1170,11 +1174,7 @@ async def make_speech(msg: types.Message):
         duration = msg.caption.replace("/speech", "").strip() if msg.caption else "5 минут"
         prompt = (f"Речь для защиты презентации на {duration}. Содержание:\n{slides_text[:8000]}\n\n"
                   f"Связный текст, абзацы. Без markdown.")
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7, max_tokens=1500
-        )
+        r = await call_groq_with_retry(messages=[{"role": "user", "content": prompt}], max_tokens=1500, temperature=0.7)
         speech = r.choices[0].message.content
         from docx import Document
         d = Document(); d.add_heading(f"Речь: {doc.file_name}", 0)
@@ -1308,10 +1308,9 @@ async def chat(msg: types.Message):
     tone_add = f"\n\nТОН: {tone}" if tone else ""
     full_prompt = f"[Сейчас: {now}]\n\n" + SYSTEM_PROMPT + personal + tone_add
     try:
-        r = await client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+        r = await call_groq_with_retry(
             messages=[{"role": "system", "content": full_prompt}, *history],
-            temperature=0.7, max_tokens=1200
+            max_tokens=1200, temperature=0.7
         )
         answer = r.choices[0].message.content
         if not answer or not answer.strip():
